@@ -1,0 +1,12 @@
+# Local secrets (WiFi credentials, OTA password) — keep the template only.
+src/secrets.h
+
+.pio/
+.pioenvs/
+build/
+libdeps/
+.vscode/
+*.log
+*.bin
+*.elf
+*.map
