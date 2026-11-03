@@ -33,6 +33,16 @@ void initZones();
 // loading NVS and after every config update that can touch zone geometry.
 void applyZones();
 
+// Selectable display schemes (see KISLAP_DEFAULT_SCHEME in config.h). The
+// numeric value is persisted to NVS, so append new schemes rather than
+// renumbering existing ones.
+enum Scheme : uint8_t {
+    SCHEME_PATRIOTIC = 0,
+    SCHEME_HALLOWEEN = 1,
+    SCHEME_AUTUMN = 2,
+    SCHEME_COUNT
+};
+
 // Runtime-tunable configuration. Every field here can be changed on the fly
 // over the REST API without recompiling; changes are persisted to NVS and
 // reloaded at boot. Hardware/sizing constants (pin, LED count/type, max ripple
@@ -42,6 +52,8 @@ void applyZones();
 // The member defaults come from the KISLAP_* macros in config.h, so a fresh
 // device (empty NVS) behaves exactly as the compiled-in defaults describe.
 struct Config {
+    // Which scheme the render loop draws (a Scheme value).
+    uint8_t  scheme              = KISLAP_DEFAULT_SCHEME;
     uint8_t  brightness          = KISLAP_BRIGHTNESS;
 
     float    rippleSpeed         = KISLAP_RIPPLE_SPEED;
@@ -80,6 +92,35 @@ struct Config {
     // (see applyZones()).
     int32_t  zoneLengths[KISLAP_NUM_ZONES] = KISLAP_ZONE_LENGTHS;
     int32_t  zoneIntros[KISLAP_NUM_ZONES]  = KISLAP_ZONE_INTRO_LENGTHS;
+
+    // Halloween scheme geometry (see config.h). Section width excludes the black
+    // separator pixel; fade width is clamped to at most half a section.
+    int32_t  halloweenSectionWidth = KISLAP_HALLOWEEN_SECTION_WIDTH;
+    int32_t  halloweenFadeWidth    = KISLAP_HALLOWEEN_FADE_WIDTH;
+
+    // Halloween lightning (see config.h). Interval is wall-clock ms between
+    // strikes; length is the bolt's pixel span; ambient is how strongly a flash
+    // washes the whole strip (0-255).
+    bool     lightningEnabled        = KISLAP_LIGHTNING_ENABLED;
+    uint32_t lightningMinIntervalMs  = KISLAP_LIGHTNING_MIN_INTERVAL_MS;
+    uint32_t lightningMaxIntervalMs  = KISLAP_LIGHTNING_MAX_INTERVAL_MS;
+    int32_t  lightningMinLength      = KISLAP_LIGHTNING_MIN_LENGTH;
+    int32_t  lightningMaxLength      = KISLAP_LIGHTNING_MAX_LENGTH;
+    int32_t  lightningAmbient        = KISLAP_LIGHTNING_AMBIENT;
+
+    // Autumn scheme (see config.h). Sizes are pixels; rate is new leaves per
+    // frame; fall times and gust intervals are frames; flutter and background
+    // are 0-255 levels.
+    int32_t  autumnLeafMinSize       = KISLAP_AUTUMN_LEAF_MIN_SIZE;
+    int32_t  autumnLeafMaxSize       = KISLAP_AUTUMN_LEAF_MAX_SIZE;
+    float    autumnLeafRate          = KISLAP_AUTUMN_LEAF_RATE;
+    uint32_t autumnFallMinFrames     = KISLAP_AUTUMN_FALL_MIN_FRAMES;
+    uint32_t autumnFallMaxFrames     = KISLAP_AUTUMN_FALL_MAX_FRAMES;
+    float    autumnGustStrength      = KISLAP_AUTUMN_GUST_STRENGTH;
+    uint32_t autumnGustMinIntervalFrames = KISLAP_AUTUMN_GUST_MIN_INTERVAL_FRAMES;
+    uint32_t autumnGustMaxIntervalFrames = KISLAP_AUTUMN_GUST_MAX_INTERVAL_FRAMES;
+    int32_t  autumnFlutter           = KISLAP_AUTUMN_FLUTTER;
+    int32_t  autumnBackground        = KISLAP_AUTUMN_BACKGROUND;
 };
 
 // The single live config instance, defined in runtime_config.cpp.

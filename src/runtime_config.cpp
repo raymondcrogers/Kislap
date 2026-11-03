@@ -45,6 +45,7 @@ static Preferences prefs;
 static const char* NVS_NAMESPACE = "kislap";
 
 namespace keys {
+    static const char* scheme = "scheme";
     static const char* brightness = "bright";
     static const char* rippleSpeed = "rspeed";
     static const char* rippleWidth = "rwidth";
@@ -64,7 +65,28 @@ namespace keys {
     // per zone, to stay well under the 15-char NVS key limit as zone count grows.
     static const char* zoneLengths = "zonelen";
     static const char* zoneIntros = "zoneintro";
+    static const char* halloweenSection = "hwsection";
+    static const char* halloweenFade = "hwfade";
+    static const char* lightningEnabled = "ltenable";
+    static const char* lightningMinInt = "ltminms";
+    static const char* lightningMaxInt = "ltmaxms";
+    static const char* lightningMinLen = "ltminlen";
+    static const char* lightningMaxLen = "ltmaxlen";
+    static const char* lightningAmbient = "ltambient";
+    static const char* autumnLeafMinSize = "atleafmin";
+    static const char* autumnLeafMaxSize = "atleafmax";
+    static const char* autumnLeafRate = "atrate";
+    static const char* autumnFallMin = "atfallmin";
+    static const char* autumnFallMax = "atfallmax";
+    static const char* autumnGustStrength = "atguststr";
+    static const char* autumnGustMinInt = "atgustmin";
+    static const char* autumnGustMaxInt = "atgustmax";
+    static const char* autumnFlutter = "atflutter";
+    static const char* autumnBackground = "atbg";
 }
+
+// JSON names for each Scheme, indexed by its enum value.
+static const char* const SCHEME_NAMES[SCHEME_COUNT] = { "patriotic", "halloween", "autumn" };
 
 // Keep every derived value sane no matter what was loaded or posted. Runs after
 // both load and update so a half-written NVS or a partial POST can't wedge the
@@ -97,6 +119,42 @@ static void sanitize() {
 
     // Active ripple cap can't exceed the fixed pool or drop below one.
     cfg.maxRipples = constrain(cfg.maxRipples, 1, KISLAP_MAX_RIPPLES);
+
+    // An unknown scheme (e.g. NVS written by a newer build) falls back to default.
+    if (cfg.scheme >= SCHEME_COUNT) cfg.scheme = KISLAP_DEFAULT_SCHEME;
+
+    // Halloween: at least one pixel per section, and the two end fades can't
+    // run past the middle of a section.
+    if (cfg.halloweenSectionWidth < 1) cfg.halloweenSectionWidth = 1;
+    cfg.halloweenFadeWidth =
+        constrain(cfg.halloweenFadeWidth, 0, cfg.halloweenSectionWidth / 2);
+
+    // Lightning: min <= max interval, and a bolt spans at least two pixels and
+    // fits on the strip (min <= max).
+    if (cfg.lightningMaxIntervalMs < cfg.lightningMinIntervalMs) {
+        cfg.lightningMaxIntervalMs = cfg.lightningMinIntervalMs;
+    }
+    cfg.lightningMinLength = constrain(cfg.lightningMinLength, 2, KISLAP_NUM_LEDS - 1);
+    cfg.lightningMaxLength =
+        constrain(cfg.lightningMaxLength, cfg.lightningMinLength, KISLAP_NUM_LEDS - 1);
+    cfg.lightningAmbient = constrain(cfg.lightningAmbient, 0, 255);
+
+    // Autumn: leaf sizes and fall times at least 1 with min <= max, rate and
+    // gust strength non-negative, gust interval min <= max, 0-255 levels.
+    cfg.autumnLeafMinSize = constrain(cfg.autumnLeafMinSize, 1, 255);
+    cfg.autumnLeafMaxSize = constrain(cfg.autumnLeafMaxSize, cfg.autumnLeafMinSize, 255);
+    cfg.autumnLeafRate = constrain(cfg.autumnLeafRate, 0.0f, (float)KISLAP_AUTUMN_MAX_LEAVES);
+    if (cfg.autumnFallMinFrames < 1) cfg.autumnFallMinFrames = 1;
+    if (cfg.autumnFallMaxFrames < cfg.autumnFallMinFrames) {
+        cfg.autumnFallMaxFrames = cfg.autumnFallMinFrames;
+    }
+    if (cfg.autumnGustStrength < 0.0f) cfg.autumnGustStrength = 0.0f;
+    if (cfg.autumnGustMinIntervalFrames < 1) cfg.autumnGustMinIntervalFrames = 1;
+    if (cfg.autumnGustMaxIntervalFrames < cfg.autumnGustMinIntervalFrames) {
+        cfg.autumnGustMaxIntervalFrames = cfg.autumnGustMinIntervalFrames;
+    }
+    cfg.autumnFlutter = constrain(cfg.autumnFlutter, 0, 255);
+    cfg.autumnBackground = constrain(cfg.autumnBackground, 0, 255);
 }
 
 void applyConfig() {
@@ -105,7 +163,8 @@ void applyConfig() {
 
 void loadConfig() {
     prefs.begin(NVS_NAMESPACE, /*readOnly=*/true);
-    cfg.brightness          = prefs.getUChar(keys::brightness, cfg.brightness);
+    cfg.scheme              = prefs.getUChar(keys::scheme, cfg.scheme);
+    cfg.brightness         = prefs.getUChar(keys::brightness, cfg.brightness);
     cfg.rippleSpeed         = prefs.getFloat(keys::rippleSpeed, cfg.rippleSpeed);
     cfg.rippleWidth         = prefs.getFloat(keys::rippleWidth, cfg.rippleWidth);
     cfg.rippleReturnRatio   = prefs.getFloat(keys::rippleReturnRatio, cfg.rippleReturnRatio);
@@ -120,6 +179,24 @@ void loadConfig() {
     cfg.introStarEvery      = prefs.getLong(keys::introStarEvery, cfg.introStarEvery);
     cfg.introStarMin        = prefs.getLong(keys::introStarMin, cfg.introStarMin);
     cfg.frameDelayMs        = prefs.getULong(keys::frameDelayMs, cfg.frameDelayMs);
+    cfg.halloweenSectionWidth = prefs.getLong(keys::halloweenSection, cfg.halloweenSectionWidth);
+    cfg.halloweenFadeWidth  = prefs.getLong(keys::halloweenFade, cfg.halloweenFadeWidth);
+    cfg.lightningEnabled    = prefs.getBool(keys::lightningEnabled, cfg.lightningEnabled);
+    cfg.lightningMinIntervalMs = prefs.getULong(keys::lightningMinInt, cfg.lightningMinIntervalMs);
+    cfg.lightningMaxIntervalMs = prefs.getULong(keys::lightningMaxInt, cfg.lightningMaxIntervalMs);
+    cfg.lightningMinLength  = prefs.getLong(keys::lightningMinLen, cfg.lightningMinLength);
+    cfg.lightningMaxLength  = prefs.getLong(keys::lightningMaxLen, cfg.lightningMaxLength);
+    cfg.lightningAmbient    = prefs.getLong(keys::lightningAmbient, cfg.lightningAmbient);
+    cfg.autumnLeafMinSize   = prefs.getLong(keys::autumnLeafMinSize, cfg.autumnLeafMinSize);
+    cfg.autumnLeafMaxSize   = prefs.getLong(keys::autumnLeafMaxSize, cfg.autumnLeafMaxSize);
+    cfg.autumnLeafRate      = prefs.getFloat(keys::autumnLeafRate, cfg.autumnLeafRate);
+    cfg.autumnFallMinFrames = prefs.getULong(keys::autumnFallMin, cfg.autumnFallMinFrames);
+    cfg.autumnFallMaxFrames = prefs.getULong(keys::autumnFallMax, cfg.autumnFallMaxFrames);
+    cfg.autumnGustStrength  = prefs.getFloat(keys::autumnGustStrength, cfg.autumnGustStrength);
+    cfg.autumnGustMinIntervalFrames = prefs.getULong(keys::autumnGustMinInt, cfg.autumnGustMinIntervalFrames);
+    cfg.autumnGustMaxIntervalFrames = prefs.getULong(keys::autumnGustMaxInt, cfg.autumnGustMaxIntervalFrames);
+    cfg.autumnFlutter       = prefs.getLong(keys::autumnFlutter, cfg.autumnFlutter);
+    cfg.autumnBackground    = prefs.getLong(keys::autumnBackground, cfg.autumnBackground);
 
     // Zone geometry: packed int32 blobs. Only overwrite cfg's defaults if a blob
     // of the exact expected size was previously saved; a fresh, partially-written,
@@ -138,6 +215,7 @@ void loadConfig() {
 
 void saveConfig() {
     prefs.begin(NVS_NAMESPACE, /*readOnly=*/false);
+    prefs.putUChar(keys::scheme, cfg.scheme);
     prefs.putUChar(keys::brightness, cfg.brightness);
     prefs.putFloat(keys::rippleSpeed, cfg.rippleSpeed);
     prefs.putFloat(keys::rippleWidth, cfg.rippleWidth);
@@ -153,13 +231,32 @@ void saveConfig() {
     prefs.putLong(keys::introStarEvery, cfg.introStarEvery);
     prefs.putLong(keys::introStarMin, cfg.introStarMin);
     prefs.putULong(keys::frameDelayMs, cfg.frameDelayMs);
+    prefs.putLong(keys::halloweenSection, cfg.halloweenSectionWidth);
+    prefs.putLong(keys::halloweenFade, cfg.halloweenFadeWidth);
+    prefs.putBool(keys::lightningEnabled, cfg.lightningEnabled);
+    prefs.putULong(keys::lightningMinInt, cfg.lightningMinIntervalMs);
+    prefs.putULong(keys::lightningMaxInt, cfg.lightningMaxIntervalMs);
+    prefs.putLong(keys::lightningMinLen, cfg.lightningMinLength);
+    prefs.putLong(keys::lightningMaxLen, cfg.lightningMaxLength);
+    prefs.putLong(keys::lightningAmbient, cfg.lightningAmbient);
+    prefs.putLong(keys::autumnLeafMinSize, cfg.autumnLeafMinSize);
+    prefs.putLong(keys::autumnLeafMaxSize, cfg.autumnLeafMaxSize);
+    prefs.putFloat(keys::autumnLeafRate, cfg.autumnLeafRate);
+    prefs.putULong(keys::autumnFallMin, cfg.autumnFallMinFrames);
+    prefs.putULong(keys::autumnFallMax, cfg.autumnFallMaxFrames);
+    prefs.putFloat(keys::autumnGustStrength, cfg.autumnGustStrength);
+    prefs.putULong(keys::autumnGustMinInt, cfg.autumnGustMinIntervalFrames);
+    prefs.putULong(keys::autumnGustMaxInt, cfg.autumnGustMaxIntervalFrames);
+    prefs.putLong(keys::autumnFlutter, cfg.autumnFlutter);
+    prefs.putLong(keys::autumnBackground, cfg.autumnBackground);
     prefs.putBytes(keys::zoneLengths, cfg.zoneLengths, sizeof(cfg.zoneLengths));
     prefs.putBytes(keys::zoneIntros,  cfg.zoneIntros,  sizeof(cfg.zoneIntros));
     prefs.end();
 }
 
 void configToJson(JsonDocument& doc) {
-    doc["brightness"]          = cfg.brightness;
+    doc["scheme"]              = SCHEME_NAMES[cfg.scheme];
+    doc["brightness"]         = cfg.brightness;
     doc["rippleSpeed"]         = cfg.rippleSpeed;
     doc["rippleWidth"]         = cfg.rippleWidth;
     doc["rippleReturnRatio"]   = cfg.rippleReturnRatio;
@@ -174,6 +271,24 @@ void configToJson(JsonDocument& doc) {
     doc["introStarEvery"]      = cfg.introStarEvery;
     doc["introStarMin"]        = cfg.introStarMin;
     doc["frameDelayMs"]        = cfg.frameDelayMs;
+    doc["halloweenSectionWidth"] = cfg.halloweenSectionWidth;
+    doc["halloweenFadeWidth"]  = cfg.halloweenFadeWidth;
+    doc["lightningEnabled"]    = cfg.lightningEnabled;
+    doc["lightningMinIntervalMs"] = cfg.lightningMinIntervalMs;
+    doc["lightningMaxIntervalMs"] = cfg.lightningMaxIntervalMs;
+    doc["lightningMinLength"]  = cfg.lightningMinLength;
+    doc["lightningMaxLength"]  = cfg.lightningMaxLength;
+    doc["lightningAmbient"]    = cfg.lightningAmbient;
+    doc["autumnLeafMinSize"]   = cfg.autumnLeafMinSize;
+    doc["autumnLeafMaxSize"]   = cfg.autumnLeafMaxSize;
+    doc["autumnLeafRate"]      = cfg.autumnLeafRate;
+    doc["autumnFallMinFrames"] = cfg.autumnFallMinFrames;
+    doc["autumnFallMaxFrames"] = cfg.autumnFallMaxFrames;
+    doc["autumnGustStrength"]  = cfg.autumnGustStrength;
+    doc["autumnGustMinIntervalFrames"] = cfg.autumnGustMinIntervalFrames;
+    doc["autumnGustMaxIntervalFrames"] = cfg.autumnGustMaxIntervalFrames;
+    doc["autumnFlutter"]       = cfg.autumnFlutter;
+    doc["autumnBackground"]    = cfg.autumnBackground;
 
     // Zone geometry. `length` and `introPixels` are the settable inputs (see
     // configFromJson); `start`/`end` are the derived absolute bounds, echoed for
@@ -192,6 +307,21 @@ bool configFromJson(const JsonDocument& doc, String& err) {
     if (!doc.is<JsonObjectConst>()) {
         err = "body must be a JSON object";
         return false;
+    }
+
+    // Scheme, by name (case-insensitive). Validated before any other field is
+    // touched so a bad name rejects the whole update rather than half-applying it.
+    if (!doc["scheme"].isNull()) {
+        const char* name = doc["scheme"].as<const char*>();
+        int found = -1;
+        for (int s = 0; name && s < SCHEME_COUNT; s++) {
+            if (strcasecmp(name, SCHEME_NAMES[s]) == 0) found = s;
+        }
+        if (found < 0) {
+            err = "scheme must be \"patriotic\", \"halloween\" or \"autumn\"";
+            return false;
+        }
+        cfg.scheme = (uint8_t)found;
     }
 
     // Brightness is a hard 0-255 range; clamp explicitly since it's a uint8_t.
@@ -219,6 +349,42 @@ bool configFromJson(const JsonDocument& doc, String& err) {
     if (doc["introStarMin"].is<int>())   cfg.introStarMin   = doc["introStarMin"].as<int>();
     if (doc["frameDelayMs"].is<uint32_t>())
         cfg.frameDelayMs = doc["frameDelayMs"].as<uint32_t>();
+    if (doc["halloweenSectionWidth"].is<int>())
+        cfg.halloweenSectionWidth = doc["halloweenSectionWidth"].as<int>();
+    if (doc["halloweenFadeWidth"].is<int>())
+        cfg.halloweenFadeWidth = doc["halloweenFadeWidth"].as<int>();
+    if (doc["lightningEnabled"].is<bool>())
+        cfg.lightningEnabled = doc["lightningEnabled"].as<bool>();
+    if (doc["lightningMinIntervalMs"].is<uint32_t>())
+        cfg.lightningMinIntervalMs = doc["lightningMinIntervalMs"].as<uint32_t>();
+    if (doc["lightningMaxIntervalMs"].is<uint32_t>())
+        cfg.lightningMaxIntervalMs = doc["lightningMaxIntervalMs"].as<uint32_t>();
+    if (doc["lightningMinLength"].is<int>())
+        cfg.lightningMinLength = doc["lightningMinLength"].as<int>();
+    if (doc["lightningMaxLength"].is<int>())
+        cfg.lightningMaxLength = doc["lightningMaxLength"].as<int>();
+    if (doc["lightningAmbient"].is<int>())
+        cfg.lightningAmbient = doc["lightningAmbient"].as<int>();
+    if (doc["autumnLeafMinSize"].is<int>())
+        cfg.autumnLeafMinSize = doc["autumnLeafMinSize"].as<int>();
+    if (doc["autumnLeafMaxSize"].is<int>())
+        cfg.autumnLeafMaxSize = doc["autumnLeafMaxSize"].as<int>();
+    if (doc["autumnLeafRate"].is<float>())
+        cfg.autumnLeafRate = doc["autumnLeafRate"].as<float>();
+    if (doc["autumnFallMinFrames"].is<uint32_t>())
+        cfg.autumnFallMinFrames = doc["autumnFallMinFrames"].as<uint32_t>();
+    if (doc["autumnFallMaxFrames"].is<uint32_t>())
+        cfg.autumnFallMaxFrames = doc["autumnFallMaxFrames"].as<uint32_t>();
+    if (doc["autumnGustStrength"].is<float>())
+        cfg.autumnGustStrength = doc["autumnGustStrength"].as<float>();
+    if (doc["autumnGustMinIntervalFrames"].is<uint32_t>())
+        cfg.autumnGustMinIntervalFrames = doc["autumnGustMinIntervalFrames"].as<uint32_t>();
+    if (doc["autumnGustMaxIntervalFrames"].is<uint32_t>())
+        cfg.autumnGustMaxIntervalFrames = doc["autumnGustMaxIntervalFrames"].as<uint32_t>();
+    if (doc["autumnFlutter"].is<int>())
+        cfg.autumnFlutter = doc["autumnFlutter"].as<int>();
+    if (doc["autumnBackground"].is<int>())
+        cfg.autumnBackground = doc["autumnBackground"].as<int>();
 
     // Zone geometry. Accept an array positionally aligned with the zones (index 0
     // = zone 0, ...). Only the elements present are touched, and within each only

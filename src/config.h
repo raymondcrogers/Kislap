@@ -40,6 +40,122 @@
 // Initial brightness (0-255).
 #define KISLAP_BRIGHTNESS 128
 
+// --- Schemes ---------------------------------------------------------------
+// The strip shows one of several complete looks ("schemes"), selected live over
+// the REST API ("scheme": "patriotic" | "halloween" | "autumn") and persisted
+// to NVS.
+// Switching schemes leaves every other scheme's settings untouched, so a scheme
+// can be put away and brought back later exactly as it was.
+//
+//   SCHEME_PATRIOTIC -- per-zone blue/star intro + red/white stripes, pushed
+//                       around by traveling wind ripples (everything under
+//                       "Zones", "Intro section" and "Ripple effect" below).
+//   SCHEME_HALLOWEEN -- alternating dark green / deep purple sections with
+//                       faded ends (see "Halloween scheme" below).
+//   SCHEME_AUTUMN    -- red/orange/yellow/brown leaves falling and blowing
+//                       across the strip as if seen through a long slit,
+//                       tumbling and flickering, with occasional gusts (see
+//                       "Autumn scheme" below).
+//
+// Scheme used on a device that has never saved one.
+#define KISLAP_DEFAULT_SCHEME SCHEME_HALLOWEEN
+
+// --- Halloween scheme ------------------------------------------------------
+// Static pattern of alternating colored sections running the length of the
+// whole strip (zones don't apply). Each section is
+// KISLAP_HALLOWEEN_SECTION_WIDTH pixels, and a single fully-black pixel sits
+// between neighboring sections. The first and last KISLAP_HALLOWEEN_FADE_WIDTH
+// pixels of each section ramp between near-black and the full section color, so
+// each section fades in from, and out to, its black separator.
+#define KISLAP_HALLOWEEN_COLOR_A 0x004400  // DarkGreen
+#define KISLAP_HALLOWEEN_COLOR_B 0x110015  // DeepPurple
+#define KISLAP_HALLOWEEN_SECTION_WIDTH 40
+#define KISLAP_HALLOWEEN_FADE_WIDTH 5
+
+// --- Halloween lightning ---------------------------------------------------
+// Sporadic lightning drawn over the Halloween sections. Each strike picks a
+// random start pixel and a random end pixel KISLAP_LIGHTNING_MIN/MAX_LENGTH
+// pixels away (either direction), then:
+//   1. leader  -- a dim, crackling channel races from the start pixel to the
+//                 end pixel over a few frames, with a bright tip;
+//   2. strobe  -- the full bolt flashes on and off several times (the first,
+//                 brightest flash being the "return stroke"), each flash also
+//                 washing the surrounding pixels toward white as if lighting
+//                 the sky -- out to half the bolt's length past each end;
+//   3. afterglow -- the channel fades back down to the base pattern.
+// The gap between strikes is wall-clock time (so "about every 5 seconds" holds
+// regardless of frame rate), picked at random from the range below. The leader
+// and strobe are paced in frames so every flash and gap lasts at least one
+// rendered frame and is never skipped.
+#define KISLAP_LIGHTNING_ENABLED true
+#define KISLAP_LIGHTNING_MIN_INTERVAL_MS 3000
+#define KISLAP_LIGHTNING_MAX_INTERVAL_MS 7000
+#define KISLAP_LIGHTNING_MIN_LENGTH 60
+#define KISLAP_LIGHTNING_MAX_LENGTH 200
+// Bolt color: a cold blue-white.
+#define KISLAP_LIGHTNING_COLOR 0xC0D0FF
+// How far the pixels around the bolt are blended toward the bolt color during
+// a full-strength flash (0-255). The glow covers the bolt plus half its length
+// past each end, tapering to nothing at the edge. 0 lights only the bolt itself.
+#define KISLAP_LIGHTNING_AMBIENT 48
+
+// --- Autumn scheme ---------------------------------------------------------
+// The strip is treated as a long horizontal slit that colorful leaves fall and
+// blow across. Nothing slides along the strip: each leaf pops into view at a
+// random spot, crosses the slit, and is gone. While it crosses, the slice of it
+// the slit shows starts as a sliver (the leaf's tip), widens to the leaf's full
+// width at its middle, and narrows back to nothing (its stem end). On the way
+// through, the leaf tumbles: its visible width pulses as it turns edge-on and
+// back, its color swings between its front and its paler back side, and it
+// flickers as it catches the light. Every so often a gust rolls in: leaves come
+// thicker and faster, and tumble and flicker harder, before it dies back down.
+//
+// Palette colors, picked to read correctly on LEDs (brown is a dim orange, and
+// "light yellow" is a warm yellow so it doesn't look green or white). Each leaf
+// gets a random color from (or between) these.
+#define KISLAP_AUTUMN_RED    0xB00800
+#define KISLAP_AUTUMN_ORANGE 0xFF3800
+#define KISLAP_AUTUMN_YELLOW 0xFFA020
+#define KISLAP_AUTUMN_BROWN  0x3A1404
+// Color a leaf's back side is lightened toward (leaf undersides are paler).
+#define KISLAP_AUTUMN_UNDERSIDE 0xFFC060
+// Dim backdrop showing through the gaps between leaves. The color is fixed; its
+// level (0-255, 0 = gaps are black) is KISLAP_AUTUMN_BACKGROUND.
+#define KISLAP_AUTUMN_BACKGROUND_COLOR 0x401204
+#define KISLAP_AUTUMN_BACKGROUND 60
+
+// Leaf width range (pixels) at the leaf's widest point. Each leaf picks a random
+// width in this range.
+#define KISLAP_AUTUMN_LEAF_MIN_SIZE 5
+#define KISLAP_AUTUMN_LEAF_MAX_SIZE 16
+
+// How many new leaves enter the slit per frame, on average, in calm air
+// (fractions allowed: 0.5 = one leaf every other frame). More = denser leaves.
+#define KISLAP_AUTUMN_LEAF_RATE 0.8f
+
+// How long one leaf takes to cross the slit, in rendered frames, in calm air.
+// Each leaf picks a random time in this range. Smaller = faster-falling leaves.
+#define KISLAP_AUTUMN_FALL_MIN_FRAMES 20
+#define KISLAP_AUTUMN_FALL_MAX_FRAMES 50
+
+// How much a full-strength gust ramps things up: leaf rate, crossing speed and
+// tumble speed are all multiplied by up to (1 + this) at a gust's peak. Each
+// gust picks a random strength, so most peak somewhat below this. 0 = no gusts.
+#define KISLAP_AUTUMN_GUST_STRENGTH 2.0f
+
+// Gap between gusts, in rendered frames (same clock as the ripples). A new gust
+// starts at a random interval in this range.
+#define KISLAP_AUTUMN_GUST_MIN_INTERVAL_FRAMES 100
+#define KISLAP_AUTUMN_GUST_MAX_INTERVAL_FRAMES 300
+
+// Flutter depth (0-255): how much a leaf dims at the bottom of its flicker
+// during a full gust. Calm air flutters at about a third of this. 0 disables.
+#define KISLAP_AUTUMN_FLUTTER 120
+
+// Leaf pool capacity: the most leaves that can be in the slit at once. Sizes an
+// array, so compile-time only.
+#define KISLAP_AUTUMN_MAX_LEAVES 128
+
 // --- Zones -------------------------------------------------------------
 // The strip runs around several sides of the house; each side is a "zone"
 // that starts with a blue/star intro and ends with red/white stripes. Zone
