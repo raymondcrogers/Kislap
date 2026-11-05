@@ -51,6 +51,17 @@ enum Scheme : uint8_t {
 //
 // The member defaults come from the KISLAP_* macros in config.h, so a fresh
 // device (empty NVS) behaves exactly as the compiled-in defaults describe.
+//
+// Adding, removing or renaming a setting -- checklist:
+//   1. Declare the member here, defaulting to a KISLAP_* macro in config.h.
+//   2. Add one row to FIELDS in runtime_config.cpp, in the same position
+//      as the member here. That row is the only other place you touch: it
+//      drives the /api/config JSON, the NVS load/save, the single-field range
+//      clamps and the /api/schema entry. The JSON key is the member name.
+//   3. Only if the new setting depends on another one (min <= max pairs, etc.),
+//      add the rule to sanitize() and describe it in the row's help text.
+// A static_assert in runtime_config.cpp fails the build if a member here has no
+// row, or a row is out of order or has the wrong type.
 struct Config {
     // Which scheme the render loop draws (a Scheme value).
     uint8_t  scheme              = KISLAP_DEFAULT_SCHEME;
@@ -147,3 +158,15 @@ void configToJson(JsonDocument& doc);
 // with `err` set if the payload is structurally unusable; individual
 // out-of-range fields are clamped rather than rejected.
 bool configFromJson(const JsonDocument& doc, String& err);
+
+// Version of the /api/schema document's own shape. Bump it only for breaking
+// changes to that shape (renamed/removed schema keys, changed meaning); adding
+// settings, groups or schemes does not change it.
+#define KISLAP_SCHEMA_VERSION 1
+
+// Stream the self-describing settings schema (GET /api/schema) to `out`. The
+// output is generated from the same field table that drives configToJson /
+// configFromJson, and is identical on every call (it depends only on
+// compile-time values), so its length can be measured once and cached. Uses
+// only a small transient JsonDocument per entry, never the whole document.
+void writeConfigSchema(Print& out);

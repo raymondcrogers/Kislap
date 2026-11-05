@@ -1,5 +1,6 @@
 #include "runtime_config.h"
 
+#include <stddef.h>
 #include <FastLED.h>
 #include <Preferences.h>
 
@@ -39,122 +40,508 @@ void initZones() {
     applyZones();
 }
 
-// NVS namespace and short keys. NVS keys are limited to 15 characters, so these
-// are abbreviated rather than matching the JSON field names one-to-one.
+// NVS namespace. Each scalar setting's NVS key lives in its CONFIG_FIELDS row
+// below. NVS keys are limited to 15 characters, so they are abbreviated rather
+// than matching the JSON field names one-to-one. Never change an existing key:
+// devices in the field would silently fall back to defaults.
 static Preferences prefs;
 static const char* NVS_NAMESPACE = "kislap";
 
+// Zone geometry is stored as packed blobs (one int32 per zone) rather than a key
+// per zone, to stay well under the 15-char NVS key limit as zone count grows.
 namespace keys {
-    static const char* scheme = "scheme";
-    static const char* brightness = "bright";
-    static const char* rippleSpeed = "rspeed";
-    static const char* rippleWidth = "rwidth";
-    static const char* rippleReturnRatio = "rretratio";
-    static const char* rippleMinAmp = "rminamp";
-    static const char* rippleMaxAmp = "rmaxamp";
-    static const char* rippleMinInt = "rminintf";
-    static const char* rippleMaxInt = "rmaxintf";
-    static const char* rippleShade = "rshade";
-    static const char* rippleBaseLevel = "rbase";
-    static const char* maxRipples = "maxrip";
-    static const char* stripeWidth = "stripew";
-    static const char* introStarEvery = "introse";
-    static const char* introStarMin = "introsm";
-    static const char* frameDelayMs = "framems";
-    // Zone geometry stored as packed blobs (one int32 per zone) rather than a key
-    // per zone, to stay well under the 15-char NVS key limit as zone count grows.
-    static const char* zoneLengths = "zonelen";
-    static const char* zoneIntros = "zoneintro";
-    static const char* halloweenSection = "hwsection";
-    static const char* halloweenFade = "hwfade";
-    static const char* lightningEnabled = "ltenable";
-    static const char* lightningMinInt = "ltminms";
-    static const char* lightningMaxInt = "ltmaxms";
-    static const char* lightningMinLen = "ltminlen";
-    static const char* lightningMaxLen = "ltmaxlen";
-    static const char* lightningAmbient = "ltambient";
-    static const char* autumnLeafMinSize = "atleafmin";
-    static const char* autumnLeafMaxSize = "atleafmax";
-    static const char* autumnLeafRate = "atrate";
-    static const char* autumnFallMin = "atfallmin";
-    static const char* autumnFallMax = "atfallmax";
-    static const char* autumnGustStrength = "atguststr";
-    static const char* autumnGustMinInt = "atgustmin";
-    static const char* autumnGustMaxInt = "atgustmax";
-    static const char* autumnFlutter = "atflutter";
-    static const char* autumnBackground = "atbg";
+    constexpr const char* zoneLengths = "zonelen";
+    constexpr const char* zoneIntros = "zoneintro";
 }
 
-// JSON names for each Scheme, indexed by its enum value.
-static const char* const SCHEME_NAMES[SCHEME_COUNT] = { "patriotic", "halloween", "autumn" };
+// JSON names for each Scheme, indexed by its enum value. configFromJson
+// validates "scheme" against this table and /api/schema lists it, so adding a
+// scheme here (plus its enum value and label) updates both.
+static const char* const SCHEME_NAMES[] = { "patriotic", "halloween", "autumn" };
+// Human-readable labels for /api/schema, same order as SCHEME_NAMES.
+static const char* const SCHEME_LABELS[] = { "Patriotic", "Halloween", "Autumn" };
+static_assert(sizeof(SCHEME_NAMES) / sizeof(SCHEME_NAMES[0]) == SCHEME_COUNT,
+              "SCHEME_NAMES needs exactly one name per Scheme enum value");
+static_assert(sizeof(SCHEME_LABELS) / sizeof(SCHEME_LABELS[0]) == SCHEME_COUNT,
+              "SCHEME_LABELS needs exactly one label per Scheme enum value");
+
+// ---------------------------------------------------------------------------
+// Field table: the single description of every runtime setting.
+//
+// One row per Config member, in the same order as the members are declared in
+// runtime_config.h. Each row drives:
+//   * configToJson / configFromJson (the row's JSON key and value type),
+//   * loadConfig / saveConfig       (its NVS key and storage type),
+//   * sanitize()                    (its single-field min/max clamp),
+//   * GET /api/schema               (label, group, limits, step, unit, help).
+// Because the clamp and the schema read the same min/max, the limits a client
+// sees are always the limits the firmware enforces. Rules that involve two
+// settings (min <= max pairs, the Halloween fade cap) stay hand-written in
+// sanitize() and are described in the rows' help text.
+//
+// The whole table is constexpr, so it and every string in it live in flash.
+// ---------------------------------------------------------------------------
+namespace {
+
+// What a setting is, as a client sees it (the schema's "type").
+enum class Kind : uint8_t { Int, Float, Bool, Enum, String, Array };
+
+// How a setting is stored in Config (and NVS).
+enum class Store : uint8_t { U8, I32, U32, F32, Bool, Zones };
+
+// Store tag for a Config member's C++ type, so a row can't claim the wrong one.
+template <typename T> struct StoreOf;
+template <> struct StoreOf<uint8_t>  { static constexpr Store value = Store::U8; };
+template <> struct StoreOf<int32_t>  { static constexpr Store value = Store::I32; };
+template <> struct StoreOf<uint32_t> { static constexpr Store value = Store::U32; };
+template <> struct StoreOf<float>    { static constexpr Store value = Store::F32; };
+template <> struct StoreOf<bool>     { static constexpr Store value = Store::Bool; };
+
+// Settings groups shown by clients. A group tied to a scheme only matters while
+// that scheme is selected; groups with no scheme always apply.
+enum Group : uint8_t {
+    G_GENERAL, G_PATRIOTIC, G_RIPPLES, G_HALLOWEEN, G_LIGHTNING, G_AUTUMN, G_COUNT
+};
+
+struct GroupDesc {
+    const char* id;
+    const char* label;
+    int8_t scheme;  // a Scheme value, or -1 for scheme-independent
+};
+
+constexpr GroupDesc GROUPS[] = {
+    { "general",   "General",      -1 },
+    { "patriotic", "Patriotic",    SCHEME_PATRIOTIC },
+    { "ripples",   "Wind ripples", SCHEME_PATRIOTIC },
+    { "halloween", "Halloween",    SCHEME_HALLOWEEN },
+    { "lightning", "Lightning",    SCHEME_HALLOWEEN },
+    { "autumn",    "Autumn",       SCHEME_AUTUMN },
+};
+static_assert(sizeof(GROUPS) / sizeof(GROUPS[0]) == G_COUNT,
+              "GROUPS needs exactly one entry per Group value");
+
+enum : uint8_t { HAS_MIN = 1, HAS_MAX = 2 };
+
+struct FieldDesc {
+    const char* key;      // JSON name in /api/config (= the Config member name)
+    const char* nvsKey;   // NVS key (nullptr for the zones array, stored apart)
+    const char* label;
+    const char* unit;     // "" when none
+    const char* help;
+    const char* const* options;  // Kind::Enum only: allowed names, by value
+    uint8_t  optionCount;
+    uint16_t offset;      // offsetof(Config, member)
+    uint16_t size;        // bytes the row covers in Config
+    Kind     kind;
+    Store    store;
+    Group    group;
+    uint8_t  limits;      // HAS_MIN | HAS_MAX
+    double   min;
+    double   max;
+    double   step;        // UI step hint (0 = none)
+};
+
+// Limit helpers for the FIELD rows. Each expands to the row's
+// limits, min, max members.
+#define LIM_NONE           0, 0.0, 0.0
+#define LIM_MIN(lo)        HAS_MIN, (double)(lo), 0.0
+#define LIM_RANGE(lo, hi)  (HAS_MIN | HAS_MAX), (double)(lo), (double)(hi)
+
+// A scalar setting. The JSON key is the member name itself, so the two can
+// never drift apart.
+#define FIELD(member, kind, nvs, group, label, limits, step, unit, help)      \
+    { #member, nvs, label, unit, help, nullptr, 0,                            \
+      (uint16_t)offsetof(Config, member), (uint16_t)sizeof(Config::member),   \
+      Kind::kind, StoreOf<decltype(Config::member)>::value, group, limits,    \
+      step }
+
+// A setting chosen by name from a fixed list (stored as its index).
+#define ENUM_FIELD(member, nvs, group, label, names, help)                    \
+    { #member, nvs, label, "", help, names,                                   \
+      (uint8_t)(sizeof(names) / sizeof(names[0])),                            \
+      (uint16_t)offsetof(Config, member), (uint16_t)sizeof(Config::member),   \
+      Kind::Enum, StoreOf<decltype(Config::member)>::value, group, LIM_NONE,  \
+      0 }
+
+// Widest a single zone (or its intro) can be: every other zone keeps >= 1 LED.
+#define ZONE_MAX_PIXELS (KISLAP_NUM_LEDS - (KISLAP_NUM_ZONES - 1))
+
+constexpr FieldDesc FIELDS[] = {
+    ENUM_FIELD(scheme, "scheme", G_GENERAL, "Scheme", SCHEME_NAMES,
+        "Which look the strip shows; each scheme keeps its own settings while "
+        "another one is showing."),
+    FIELD(brightness, Int, "bright", G_GENERAL, "Brightness",
+        LIM_RANGE(0, 255), 1, "",
+        "Global LED brightness."),
+
+    FIELD(rippleSpeed, Float, "rspeed", G_RIPPLES, "Ripple speed",
+        LIM_NONE, 0.1, "px/frame",
+        "How far each wind ripple travels along the strip per frame."),
+    FIELD(rippleWidth, Float, "rwidth", G_RIPPLES, "Ripple width",
+        LIM_MIN(0.1), 0.5, "px",
+        "Spread of a typical ripple; stronger ripples are drawn proportionally "
+        "wider."),
+    FIELD(rippleReturnRatio, Float, "rretratio", G_RIPPLES, "Return ratio",
+        LIM_MIN(0.1), 0.1, "",
+        "How much wider a ripple's trailing side is than its leading side "
+        "(1 = symmetric, above 1 = slower, gentler return)."),
+    FIELD(rippleMinAmp, Float, "rminamp", G_RIPPLES, "Min strength",
+        LIM_MIN(0), 0.5, "px",
+        "Smallest peak displacement a ripple can have; keep it at or below "
+        "Max strength."),
+    FIELD(rippleMaxAmp, Float, "rmaxamp", G_RIPPLES, "Max strength",
+        LIM_MIN(0), 0.5, "px",
+        "Largest peak displacement a ripple can have; raised to Min strength "
+        "if set lower."),
+    FIELD(rippleMinIntervalFrames, Int, "rminintf", G_RIPPLES, "Min gap",
+        LIM_MIN(0), 1, "frames",
+        "Fewest frames between ripple launches; keep it at or below Max gap."),
+    FIELD(rippleMaxIntervalFrames, Int, "rmaxintf", G_RIPPLES, "Max gap",
+        LIM_MIN(0), 1, "frames",
+        "Most frames between ripple launches; raised to Min gap if set lower."),
+    FIELD(rippleShade, Float, "rshade", G_RIPPLES, "Shading",
+        LIM_MIN(0), 0.01, "",
+        "How strongly a ripple's leading edge brightens and its trailing edge "
+        "darkens (0 = off)."),
+    FIELD(rippleBaseLevel, Float, "rbase", G_RIPPLES, "Resting level",
+        LIM_RANGE(0, 1), 0.01, "",
+        "Brightness of the pattern where no ripple is passing, as a fraction "
+        "of full, leaving headroom for crests to brighten."),
+    FIELD(maxRipples, Int, "maxrip", G_RIPPLES, "Max ripples",
+        LIM_RANGE(1, KISLAP_MAX_RIPPLES), 1, "",
+        "Most ripples allowed in flight at once."),
+
+    FIELD(stripeWidth, Int, "stripew", G_PATRIOTIC, "Stripe width",
+        LIM_MIN(1), 1, "px",
+        "Width of each red or white stripe."),
+    FIELD(introStarEvery, Int, "introse", G_PATRIOTIC, "Star spacing",
+        LIM_MIN(1), 1, "px",
+        "Every Nth pixel of each zone's blue intro is a twinkling white star."),
+    FIELD(introStarMin, Int, "introsm", G_PATRIOTIC, "Star dim level",
+        LIM_RANGE(0, 255), 1, "",
+        "How bright a star stays at the dim end of its twinkle (0 = fades "
+        "fully into the blue, 255 = always white)."),
+    FIELD(frameDelayMs, Int, "framems", G_GENERAL, "Frame delay",
+        LIM_MIN(0), 1, "ms",
+        "Pause after each rendered frame; larger values slow every animation "
+        "down evenly."),
+
+    // zoneLengths + zoneIntros, shown to clients as one "zones" array of
+    // objects. Its JSON, NVS and clamping are handled by hand (see
+    // configToJson, configFromJson, loadConfig, applyZones); its items are
+    // described by ZONE_ITEMS below.
+    { "zones", nullptr, "Zones", "",
+      "Each zone covers one side of the house: a blue intro with twinkling "
+      "stars, then red and white stripes; the last zone's length is set "
+      "automatically so the zones always cover the whole strip.",
+      nullptr, 0,
+      (uint16_t)offsetof(Config, zoneLengths),
+      (uint16_t)(sizeof(Config::zoneLengths) + sizeof(Config::zoneIntros)),
+      Kind::Array, Store::Zones, G_PATRIOTIC, LIM_NONE, 0 },
+
+    FIELD(halloweenSectionWidth, Int, "hwsection", G_HALLOWEEN, "Section width",
+        LIM_MIN(1), 1, "px",
+        "Width of each green or purple section, not counting the black pixel "
+        "between sections."),
+    FIELD(halloweenFadeWidth, Int, "hwfade", G_HALLOWEEN, "Fade width",
+        LIM_MIN(0), 1, "px",
+        "Pixels at each end of a section that fade to black; capped at half "
+        "the Section width."),
+
+    FIELD(lightningEnabled, Bool, "ltenable", G_LIGHTNING, "Lightning",
+        LIM_NONE, 0, "",
+        "Draw occasional lightning strikes over the Halloween sections."),
+    FIELD(lightningMinIntervalMs, Int, "ltminms", G_LIGHTNING, "Min gap",
+        LIM_MIN(0), 100, "ms",
+        "Shortest time between strikes; keep it at or below Max gap."),
+    FIELD(lightningMaxIntervalMs, Int, "ltmaxms", G_LIGHTNING, "Max gap",
+        LIM_MIN(0), 100, "ms",
+        "Longest time between strikes; raised to Min gap if set lower."),
+    FIELD(lightningMinLength, Int, "ltminlen", G_LIGHTNING, "Min bolt length",
+        LIM_RANGE(2, KISLAP_NUM_LEDS - 1), 1, "px",
+        "Shortest lightning bolt; keep it at or below Max bolt length."),
+    FIELD(lightningMaxLength, Int, "ltmaxlen", G_LIGHTNING, "Max bolt length",
+        LIM_RANGE(2, KISLAP_NUM_LEDS - 1), 1, "px",
+        "Longest lightning bolt; raised to Min bolt length if set lower."),
+    FIELD(lightningAmbient, Int, "ltambient", G_LIGHTNING, "Glow",
+        LIM_RANGE(0, 255), 1, "",
+        "How strongly each flash lights the pixels around the bolt, out to "
+        "half the bolt's length past each end (0 = only the bolt lights up)."),
+
+    FIELD(autumnLeafMinSize, Int, "atleafmin", G_AUTUMN, "Min leaf size",
+        LIM_RANGE(1, 255), 1, "px",
+        "Narrowest leaf; keep it at or below Max leaf size."),
+    FIELD(autumnLeafMaxSize, Int, "atleafmax", G_AUTUMN, "Max leaf size",
+        LIM_RANGE(1, 255), 1, "px",
+        "Widest leaf; raised to Min leaf size if set lower."),
+    FIELD(autumnLeafRate, Float, "atrate", G_AUTUMN, "Leaf rate",
+        LIM_RANGE(0, KISLAP_AUTUMN_MAX_LEAVES), 0.05, "leaves/frame",
+        "Average number of new leaves per frame in calm air (0.5 = one every "
+        "other frame)."),
+    FIELD(autumnFallMinFrames, Int, "atfallmin", G_AUTUMN, "Min fall time",
+        LIM_MIN(1), 1, "frames",
+        "Fewest frames a leaf takes to cross the strip in calm air; keep it "
+        "at or below Max fall time."),
+    FIELD(autumnFallMaxFrames, Int, "atfallmax", G_AUTUMN, "Max fall time",
+        LIM_MIN(1), 1, "frames",
+        "Most frames a leaf takes to cross the strip in calm air; raised to "
+        "Min fall time if set lower."),
+    FIELD(autumnGustStrength, Float, "atguststr", G_AUTUMN, "Gust strength",
+        LIM_MIN(0), 0.1, "",
+        "How much a full gust speeds up leaf rate, falling and tumbling "
+        "(each up to 1 + this times; 0 = no gusts)."),
+    FIELD(autumnGustMinIntervalFrames, Int, "atgustmin", G_AUTUMN, "Min gust gap",
+        LIM_MIN(1), 1, "frames",
+        "Fewest frames between gusts; keep it at or below Max gust gap."),
+    FIELD(autumnGustMaxIntervalFrames, Int, "atgustmax", G_AUTUMN, "Max gust gap",
+        LIM_MIN(1), 1, "frames",
+        "Most frames between gusts; raised to Min gust gap if set lower."),
+    FIELD(autumnFlutter, Int, "atflutter", G_AUTUMN, "Flutter",
+        LIM_RANGE(0, 255), 1, "",
+        "How much leaves dim at the bottom of their flicker in a full gust "
+        "(calm air flutters about a third as much; 0 = off)."),
+    FIELD(autumnBackground, Int, "atbg", G_AUTUMN, "Background",
+        LIM_RANGE(0, 255), 1, "",
+        "Brightness of the dim backdrop between leaves (0 = black)."),
+};
+
+constexpr size_t FIELD_COUNT = sizeof(FIELDS) / sizeof(FIELDS[0]);
+
+// Items of each "zones" array element, in /api/config order.
+enum : uint8_t { ITEM_READ_ONLY = 1, ITEM_READ_ONLY_ON_LAST = 2 };
+struct ZoneItemDesc {
+    const char* key;
+    uint8_t flags;
+    uint8_t limits;
+    double min;
+    double max;
+    const char* unit;
+    const char* help;
+};
+constexpr ZoneItemDesc ZONE_ITEMS[] = {
+    { "start", ITEM_READ_ONLY, LIM_NONE, "px",
+      "First LED of the zone (worked out from the zone lengths)." },
+    { "end", ITEM_READ_ONLY, LIM_NONE, "px",
+      "One past the last LED of the zone (worked out from the zone lengths)." },
+    { "length", ITEM_READ_ONLY_ON_LAST, LIM_RANGE(1, ZONE_MAX_PIXELS), "px",
+      "LEDs in the zone; each earlier zone leaves at least one LED for every "
+      "zone after it, and the last zone gets whatever is left." },
+    { "introPixels", 0, LIM_RANGE(0, ZONE_MAX_PIXELS), "px",
+      "LEDs at the start of the zone that form the blue/star intro; capped at "
+      "the zone's length." },
+};
+
+#undef FIELD
+#undef ENUM_FIELD
+#undef LIM_NONE
+#undef LIM_MIN
+#undef LIM_RANGE
+
+// --- Compile-time checks that keep the table in sync with Config -----------
+// (Recursive one-liners because the toolchain builds as C++11.)
+
+constexpr size_t storeAlign(Store s) {
+    return (s == Store::U8 || s == Store::Bool) ? 1 : 4;
+}
+constexpr size_t alignUp(size_t v, size_t a) { return (v + a - 1) / a * a; }
+
+// Row i starts exactly where the previous row ended (plus alignment padding),
+// and the last row reaches the end of Config. A Config member with no row
+// leaves a gap, so the build fails. (The one gap this can't see is a new 1-3
+// byte member that lands entirely inside existing padding; step 2 of the
+// checklist in runtime_config.h covers that.)
+constexpr bool rowsCoverConfig(size_t i, size_t end) {
+    return i == FIELD_COUNT
+        ? alignUp(end, alignof(Config)) == sizeof(Config)
+        : FIELDS[i].offset == alignUp(end, storeAlign(FIELDS[i].store)) &&
+          rowsCoverConfig(i + 1, FIELDS[i].offset + FIELDS[i].size);
+}
+static_assert(offsetof(Config, zoneIntros) ==
+                  offsetof(Config, zoneLengths) + sizeof(Config::zoneLengths),
+              "zoneIntros must directly follow zoneLengths in Config");
+static_assert(rowsCoverConfig(0, 0),
+              "FIELDS in runtime_config.cpp is out of sync with "
+              "Config: every member needs exactly one row, in declaration order");
+
+constexpr bool kindFitsStore(Kind k, Store s) {
+    return k == Kind::Int   ? (s == Store::U8 || s == Store::I32 || s == Store::U32)
+         : k == Kind::Float ? s == Store::F32
+         : k == Kind::Bool  ? s == Store::Bool
+         : k == Kind::Enum  ? s == Store::U8
+         : k == Kind::Array ? s == Store::Zones
+         : false;
+}
+constexpr bool kindsFit(size_t i) {
+    return i == FIELD_COUNT ||
+           (kindFitsStore(FIELDS[i].kind, FIELDS[i].store) && kindsFit(i + 1));
+}
+static_assert(kindsFit(0), "a FIELDS row's Kind doesn't match its member's type");
+
+constexpr bool charsEq(const char* a, const char* b) {
+    return *a == *b && (*a == '\0' || charsEq(a + 1, b + 1));
+}
+constexpr bool strEq(const char* a, const char* b) {
+    return a != nullptr && b != nullptr && charsEq(a, b);
+}
+constexpr size_t strLen(const char* s) { return *s ? 1 + strLen(s + 1) : 0; }
+
+// No two rows share a JSON key or NVS key.
+constexpr bool noDupAfter(size_t i, size_t j) {
+    return j == FIELD_COUNT ||
+           (!strEq(FIELDS[i].key, FIELDS[j].key) &&
+            !strEq(FIELDS[i].nvsKey, FIELDS[j].nvsKey) && noDupAfter(i, j + 1));
+}
+// Every NVS key fits the 15-char limit and doesn't collide with the zone blobs.
+constexpr bool nvsKeyOk(const char* k) {
+    return k == nullptr ||
+           (strLen(k) <= 15 && !strEq(k, keys::zoneLengths) &&
+            !strEq(k, keys::zoneIntros));
+}
+constexpr bool keysUnique(size_t i) {
+    return i == FIELD_COUNT ||
+           (nvsKeyOk(FIELDS[i].nvsKey) && noDupAfter(i, i + 1) && keysUnique(i + 1));
+}
+static_assert(keysUnique(0),
+              "duplicate JSON/NVS key, or NVS key longer than 15 chars, in FIELDS");
+
+// --- Typed access to a row's value inside a Config --------------------------
+
+template <typename T>
+T& member(Config& c, const FieldDesc& f) {
+    return *reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(&c) + f.offset);
+}
+template <typename T>
+const T& member(const Config& c, const FieldDesc& f) {
+    return *reinterpret_cast<const T*>(reinterpret_cast<const uint8_t*>(&c) + f.offset);
+}
+
+// Compiled-in defaults (every member initialized from its KISLAP_* macro).
+const Config DEFAULTS = Config();
+
+template <typename T>
+T clampToRow(T v, const FieldDesc& f) {
+    if ((f.limits & HAS_MIN) && v < (T)f.min) v = (T)f.min;
+    if ((f.limits & HAS_MAX) && v > (T)f.max) v = (T)f.max;
+    return v;
+}
+
+// Apply a row's own min/max (or, for an enum, its option range) to cfg.
+void clampField(const FieldDesc& f) {
+    switch (f.store) {
+        case Store::U8:
+            if (f.kind == Kind::Enum) {
+                // Unknown value (e.g. NVS written by a newer build) -> default.
+                uint8_t& v = member<uint8_t>(cfg, f);
+                if (v >= f.optionCount) v = member<uint8_t>(DEFAULTS, f);
+            } else {
+                member<uint8_t>(cfg, f) = clampToRow(member<uint8_t>(cfg, f), f);
+            }
+            break;
+        case Store::I32: member<int32_t>(cfg, f)  = clampToRow(member<int32_t>(cfg, f), f); break;
+        case Store::U32: member<uint32_t>(cfg, f) = clampToRow(member<uint32_t>(cfg, f), f); break;
+        case Store::F32: member<float>(cfg, f)    = clampToRow(member<float>(cfg, f), f); break;
+        case Store::Bool:
+        case Store::Zones:
+            break;
+    }
+}
+
+const char* kindName(Kind k) {
+    switch (k) {
+        case Kind::Int:    return "int";
+        case Kind::Float:  return "float";
+        case Kind::Bool:   return "bool";
+        case Kind::Enum:   return "enum";
+        case Kind::String: return "string";
+        case Kind::Array:  return "array";
+    }
+    return "string";
+}
+
+// Wrap a flash string so ArduinoJson stores the pointer instead of copying it.
+inline JsonString flashStr(const char* s) { return JsonString(s, true); }
+
+// Write one row's current value from `c` into `dst`.
+// (Templated so `dst` can be a doc["key"] proxy: converting that to a
+// JsonVariant first would not create the member.)
+template <typename TDst>
+void valueToJson(TDst&& dst, const FieldDesc& f, const Config& c) {
+    switch (f.store) {
+        case Store::U8:
+            if (f.kind == Kind::Enum) {
+                const uint8_t v = member<uint8_t>(c, f);
+                dst.set(flashStr(f.options[v < f.optionCount ? v : 0]));
+            } else {
+                dst.set(member<uint8_t>(c, f));
+            }
+            break;
+        case Store::I32:  dst.set(member<int32_t>(c, f)); break;
+        case Store::U32:  dst.set(member<uint32_t>(c, f)); break;
+        case Store::F32:  dst.set(member<float>(c, f)); break;
+        case Store::Bool: dst.set(member<bool>(c, f)); break;
+        case Store::Zones: break;
+    }
+}
+
+// Find `name` (case-insensitive) among an enum row's options; -1 if absent.
+int enumIndex(const FieldDesc& f, const char* name) {
+    for (int i = 0; name && i < f.optionCount; i++) {
+        if (strcasecmp(name, f.options[i]) == 0) return i;
+    }
+    return -1;
+}
+
+// e.g.  scheme must be "patriotic", "halloween" or "autumn"
+String enumError(const FieldDesc& f) {
+    String e = f.key;
+    e += " must be ";
+    for (int i = 0; i < f.optionCount; i++) {
+        if (i > 0) e += (i == f.optionCount - 1) ? " or " : ", ";
+        e += '"';
+        e += f.options[i];
+        e += '"';
+    }
+    return e;
+}
+
+}  // namespace
 
 // Keep every derived value sane no matter what was loaded or posted. Runs after
 // both load and update so a half-written NVS or a partial POST can't wedge the
 // render loop (e.g. a zero divisor or min > max).
 static void sanitize() {
-    // Amplitudes: non-negative and min <= max.
-    if (cfg.rippleMinAmp < 0.0f) cfg.rippleMinAmp = 0.0f;
-    if (cfg.rippleMaxAmp < cfg.rippleMinAmp) cfg.rippleMaxAmp = cfg.rippleMinAmp;
+    // Single-field limits come straight from the FIELDS table (the same min/max
+    // /api/schema reports), e.g. maxRipples to [1, KISLAP_MAX_RIPPLES], every
+    // 0-255 level, positive divisors and widths, unknown scheme -> default.
+    for (const FieldDesc& f : FIELDS) clampField(f);
 
-    // Intervals: min <= max (both unsigned, so only ordering to fix).
+    // Cross-field rules. Each is also described in the affected rows' help text.
+
+    // Pairs: max is raised to min when set below it.
+    if (cfg.rippleMaxAmp < cfg.rippleMinAmp) cfg.rippleMaxAmp = cfg.rippleMinAmp;
     if (cfg.rippleMaxIntervalFrames < cfg.rippleMinIntervalFrames) {
         cfg.rippleMaxIntervalFrames = cfg.rippleMinIntervalFrames;
     }
-
-    // Shading strength is non-negative (0 disables).
-    if (cfg.rippleShade < 0.0f) cfg.rippleShade = 0.0f;
-
-    // Resting brightness is a 0-1 fraction.
-    cfg.rippleBaseLevel = constrain(cfg.rippleBaseLevel, 0.0f, 1.0f);
-
-    // Divisors and spreads must stay positive.
-    if (cfg.rippleWidth < 0.1f) cfg.rippleWidth = 0.1f;
-    if (cfg.rippleReturnRatio < 0.1f) cfg.rippleReturnRatio = 0.1f;
-    if (cfg.stripeWidth < 1) cfg.stripeWidth = 1;
-    if (cfg.introStarEvery < 1) cfg.introStarEvery = 1;
-
-    // Star twinkle floor: 0 = dim end is full background blue, 255 = always
-    // white. Clamped into the blend range.
-    cfg.introStarMin = constrain(cfg.introStarMin, 0, 255);
-
-    // Active ripple cap can't exceed the fixed pool or drop below one.
-    cfg.maxRipples = constrain(cfg.maxRipples, 1, KISLAP_MAX_RIPPLES);
-
-    // An unknown scheme (e.g. NVS written by a newer build) falls back to default.
-    if (cfg.scheme >= SCHEME_COUNT) cfg.scheme = KISLAP_DEFAULT_SCHEME;
-
-    // Halloween: at least one pixel per section, and the two end fades can't
-    // run past the middle of a section.
-    if (cfg.halloweenSectionWidth < 1) cfg.halloweenSectionWidth = 1;
-    cfg.halloweenFadeWidth =
-        constrain(cfg.halloweenFadeWidth, 0, cfg.halloweenSectionWidth / 2);
-
-    // Lightning: min <= max interval, and a bolt spans at least two pixels and
-    // fits on the strip (min <= max).
     if (cfg.lightningMaxIntervalMs < cfg.lightningMinIntervalMs) {
         cfg.lightningMaxIntervalMs = cfg.lightningMinIntervalMs;
     }
-    cfg.lightningMinLength = constrain(cfg.lightningMinLength, 2, KISLAP_NUM_LEDS - 1);
-    cfg.lightningMaxLength =
-        constrain(cfg.lightningMaxLength, cfg.lightningMinLength, KISLAP_NUM_LEDS - 1);
-    cfg.lightningAmbient = constrain(cfg.lightningAmbient, 0, 255);
-
-    // Autumn: leaf sizes and fall times at least 1 with min <= max, rate and
-    // gust strength non-negative, gust interval min <= max, 0-255 levels.
-    cfg.autumnLeafMinSize = constrain(cfg.autumnLeafMinSize, 1, 255);
-    cfg.autumnLeafMaxSize = constrain(cfg.autumnLeafMaxSize, cfg.autumnLeafMinSize, 255);
-    cfg.autumnLeafRate = constrain(cfg.autumnLeafRate, 0.0f, (float)KISLAP_AUTUMN_MAX_LEAVES);
-    if (cfg.autumnFallMinFrames < 1) cfg.autumnFallMinFrames = 1;
+    if (cfg.lightningMaxLength < cfg.lightningMinLength) {
+        cfg.lightningMaxLength = cfg.lightningMinLength;
+    }
+    if (cfg.autumnLeafMaxSize < cfg.autumnLeafMinSize) {
+        cfg.autumnLeafMaxSize = cfg.autumnLeafMinSize;
+    }
     if (cfg.autumnFallMaxFrames < cfg.autumnFallMinFrames) {
         cfg.autumnFallMaxFrames = cfg.autumnFallMinFrames;
     }
-    if (cfg.autumnGustStrength < 0.0f) cfg.autumnGustStrength = 0.0f;
-    if (cfg.autumnGustMinIntervalFrames < 1) cfg.autumnGustMinIntervalFrames = 1;
     if (cfg.autumnGustMaxIntervalFrames < cfg.autumnGustMinIntervalFrames) {
         cfg.autumnGustMaxIntervalFrames = cfg.autumnGustMinIntervalFrames;
     }
-    cfg.autumnFlutter = constrain(cfg.autumnFlutter, 0, 255);
-    cfg.autumnBackground = constrain(cfg.autumnBackground, 0, 255);
+
+    // Halloween: the two end fades can't run past the middle of a section.
+    if (cfg.halloweenFadeWidth > cfg.halloweenSectionWidth / 2) {
+        cfg.halloweenFadeWidth = cfg.halloweenSectionWidth / 2;
+    }
 }
 
 void applyConfig() {
@@ -163,40 +550,28 @@ void applyConfig() {
 
 void loadConfig() {
     prefs.begin(NVS_NAMESPACE, /*readOnly=*/true);
-    cfg.scheme              = prefs.getUChar(keys::scheme, cfg.scheme);
-    cfg.brightness         = prefs.getUChar(keys::brightness, cfg.brightness);
-    cfg.rippleSpeed         = prefs.getFloat(keys::rippleSpeed, cfg.rippleSpeed);
-    cfg.rippleWidth         = prefs.getFloat(keys::rippleWidth, cfg.rippleWidth);
-    cfg.rippleReturnRatio   = prefs.getFloat(keys::rippleReturnRatio, cfg.rippleReturnRatio);
-    cfg.rippleMinAmp        = prefs.getFloat(keys::rippleMinAmp, cfg.rippleMinAmp);
-    cfg.rippleMaxAmp        = prefs.getFloat(keys::rippleMaxAmp, cfg.rippleMaxAmp);
-    cfg.rippleMinIntervalFrames = prefs.getULong(keys::rippleMinInt, cfg.rippleMinIntervalFrames);
-    cfg.rippleMaxIntervalFrames = prefs.getULong(keys::rippleMaxInt, cfg.rippleMaxIntervalFrames);
-    cfg.rippleShade         = prefs.getFloat(keys::rippleShade, cfg.rippleShade);
-    cfg.rippleBaseLevel     = prefs.getFloat(keys::rippleBaseLevel, cfg.rippleBaseLevel);
-    cfg.maxRipples          = prefs.getLong(keys::maxRipples, cfg.maxRipples);
-    cfg.stripeWidth         = prefs.getLong(keys::stripeWidth, cfg.stripeWidth);
-    cfg.introStarEvery      = prefs.getLong(keys::introStarEvery, cfg.introStarEvery);
-    cfg.introStarMin        = prefs.getLong(keys::introStarMin, cfg.introStarMin);
-    cfg.frameDelayMs        = prefs.getULong(keys::frameDelayMs, cfg.frameDelayMs);
-    cfg.halloweenSectionWidth = prefs.getLong(keys::halloweenSection, cfg.halloweenSectionWidth);
-    cfg.halloweenFadeWidth  = prefs.getLong(keys::halloweenFade, cfg.halloweenFadeWidth);
-    cfg.lightningEnabled    = prefs.getBool(keys::lightningEnabled, cfg.lightningEnabled);
-    cfg.lightningMinIntervalMs = prefs.getULong(keys::lightningMinInt, cfg.lightningMinIntervalMs);
-    cfg.lightningMaxIntervalMs = prefs.getULong(keys::lightningMaxInt, cfg.lightningMaxIntervalMs);
-    cfg.lightningMinLength  = prefs.getLong(keys::lightningMinLen, cfg.lightningMinLength);
-    cfg.lightningMaxLength  = prefs.getLong(keys::lightningMaxLen, cfg.lightningMaxLength);
-    cfg.lightningAmbient    = prefs.getLong(keys::lightningAmbient, cfg.lightningAmbient);
-    cfg.autumnLeafMinSize   = prefs.getLong(keys::autumnLeafMinSize, cfg.autumnLeafMinSize);
-    cfg.autumnLeafMaxSize   = prefs.getLong(keys::autumnLeafMaxSize, cfg.autumnLeafMaxSize);
-    cfg.autumnLeafRate      = prefs.getFloat(keys::autumnLeafRate, cfg.autumnLeafRate);
-    cfg.autumnFallMinFrames = prefs.getULong(keys::autumnFallMin, cfg.autumnFallMinFrames);
-    cfg.autumnFallMaxFrames = prefs.getULong(keys::autumnFallMax, cfg.autumnFallMaxFrames);
-    cfg.autumnGustStrength  = prefs.getFloat(keys::autumnGustStrength, cfg.autumnGustStrength);
-    cfg.autumnGustMinIntervalFrames = prefs.getULong(keys::autumnGustMinInt, cfg.autumnGustMinIntervalFrames);
-    cfg.autumnGustMaxIntervalFrames = prefs.getULong(keys::autumnGustMaxInt, cfg.autumnGustMaxIntervalFrames);
-    cfg.autumnFlutter       = prefs.getLong(keys::autumnFlutter, cfg.autumnFlutter);
-    cfg.autumnBackground    = prefs.getLong(keys::autumnBackground, cfg.autumnBackground);
+    for (const FieldDesc& f : FIELDS) {
+        // Any key never saved keeps the value already in cfg (the default).
+        switch (f.store) {
+            case Store::U8:
+                member<uint8_t>(cfg, f) = prefs.getUChar(f.nvsKey, member<uint8_t>(cfg, f));
+                break;
+            case Store::I32:
+                member<int32_t>(cfg, f) = prefs.getLong(f.nvsKey, member<int32_t>(cfg, f));
+                break;
+            case Store::U32:
+                member<uint32_t>(cfg, f) = prefs.getULong(f.nvsKey, member<uint32_t>(cfg, f));
+                break;
+            case Store::F32:
+                member<float>(cfg, f) = prefs.getFloat(f.nvsKey, member<float>(cfg, f));
+                break;
+            case Store::Bool:
+                member<bool>(cfg, f) = prefs.getBool(f.nvsKey, member<bool>(cfg, f));
+                break;
+            case Store::Zones:
+                break;
+        }
+    }
 
     // Zone geometry: packed int32 blobs. Only overwrite cfg's defaults if a blob
     // of the exact expected size was previously saved; a fresh, partially-written,
@@ -215,80 +590,25 @@ void loadConfig() {
 
 void saveConfig() {
     prefs.begin(NVS_NAMESPACE, /*readOnly=*/false);
-    prefs.putUChar(keys::scheme, cfg.scheme);
-    prefs.putUChar(keys::brightness, cfg.brightness);
-    prefs.putFloat(keys::rippleSpeed, cfg.rippleSpeed);
-    prefs.putFloat(keys::rippleWidth, cfg.rippleWidth);
-    prefs.putFloat(keys::rippleReturnRatio, cfg.rippleReturnRatio);
-    prefs.putFloat(keys::rippleMinAmp, cfg.rippleMinAmp);
-    prefs.putFloat(keys::rippleMaxAmp, cfg.rippleMaxAmp);
-    prefs.putULong(keys::rippleMinInt, cfg.rippleMinIntervalFrames);
-    prefs.putULong(keys::rippleMaxInt, cfg.rippleMaxIntervalFrames);
-    prefs.putFloat(keys::rippleShade, cfg.rippleShade);
-    prefs.putFloat(keys::rippleBaseLevel, cfg.rippleBaseLevel);
-    prefs.putLong(keys::maxRipples, cfg.maxRipples);
-    prefs.putLong(keys::stripeWidth, cfg.stripeWidth);
-    prefs.putLong(keys::introStarEvery, cfg.introStarEvery);
-    prefs.putLong(keys::introStarMin, cfg.introStarMin);
-    prefs.putULong(keys::frameDelayMs, cfg.frameDelayMs);
-    prefs.putLong(keys::halloweenSection, cfg.halloweenSectionWidth);
-    prefs.putLong(keys::halloweenFade, cfg.halloweenFadeWidth);
-    prefs.putBool(keys::lightningEnabled, cfg.lightningEnabled);
-    prefs.putULong(keys::lightningMinInt, cfg.lightningMinIntervalMs);
-    prefs.putULong(keys::lightningMaxInt, cfg.lightningMaxIntervalMs);
-    prefs.putLong(keys::lightningMinLen, cfg.lightningMinLength);
-    prefs.putLong(keys::lightningMaxLen, cfg.lightningMaxLength);
-    prefs.putLong(keys::lightningAmbient, cfg.lightningAmbient);
-    prefs.putLong(keys::autumnLeafMinSize, cfg.autumnLeafMinSize);
-    prefs.putLong(keys::autumnLeafMaxSize, cfg.autumnLeafMaxSize);
-    prefs.putFloat(keys::autumnLeafRate, cfg.autumnLeafRate);
-    prefs.putULong(keys::autumnFallMin, cfg.autumnFallMinFrames);
-    prefs.putULong(keys::autumnFallMax, cfg.autumnFallMaxFrames);
-    prefs.putFloat(keys::autumnGustStrength, cfg.autumnGustStrength);
-    prefs.putULong(keys::autumnGustMinInt, cfg.autumnGustMinIntervalFrames);
-    prefs.putULong(keys::autumnGustMaxInt, cfg.autumnGustMaxIntervalFrames);
-    prefs.putLong(keys::autumnFlutter, cfg.autumnFlutter);
-    prefs.putLong(keys::autumnBackground, cfg.autumnBackground);
+    for (const FieldDesc& f : FIELDS) {
+        switch (f.store) {
+            case Store::U8:   prefs.putUChar(f.nvsKey, member<uint8_t>(cfg, f)); break;
+            case Store::I32:  prefs.putLong(f.nvsKey, member<int32_t>(cfg, f)); break;
+            case Store::U32:  prefs.putULong(f.nvsKey, member<uint32_t>(cfg, f)); break;
+            case Store::F32:  prefs.putFloat(f.nvsKey, member<float>(cfg, f)); break;
+            case Store::Bool: prefs.putBool(f.nvsKey, member<bool>(cfg, f)); break;
+            case Store::Zones: break;
+        }
+    }
     prefs.putBytes(keys::zoneLengths, cfg.zoneLengths, sizeof(cfg.zoneLengths));
     prefs.putBytes(keys::zoneIntros,  cfg.zoneIntros,  sizeof(cfg.zoneIntros));
     prefs.end();
 }
 
 void configToJson(JsonDocument& doc) {
-    doc["scheme"]              = SCHEME_NAMES[cfg.scheme];
-    doc["brightness"]         = cfg.brightness;
-    doc["rippleSpeed"]         = cfg.rippleSpeed;
-    doc["rippleWidth"]         = cfg.rippleWidth;
-    doc["rippleReturnRatio"]   = cfg.rippleReturnRatio;
-    doc["rippleMinAmp"]        = cfg.rippleMinAmp;
-    doc["rippleMaxAmp"]        = cfg.rippleMaxAmp;
-    doc["rippleMinIntervalFrames"] = cfg.rippleMinIntervalFrames;
-    doc["rippleMaxIntervalFrames"] = cfg.rippleMaxIntervalFrames;
-    doc["rippleShade"]         = cfg.rippleShade;
-    doc["rippleBaseLevel"]     = cfg.rippleBaseLevel;
-    doc["maxRipples"]          = cfg.maxRipples;
-    doc["stripeWidth"]         = cfg.stripeWidth;
-    doc["introStarEvery"]      = cfg.introStarEvery;
-    doc["introStarMin"]        = cfg.introStarMin;
-    doc["frameDelayMs"]        = cfg.frameDelayMs;
-    doc["halloweenSectionWidth"] = cfg.halloweenSectionWidth;
-    doc["halloweenFadeWidth"]  = cfg.halloweenFadeWidth;
-    doc["lightningEnabled"]    = cfg.lightningEnabled;
-    doc["lightningMinIntervalMs"] = cfg.lightningMinIntervalMs;
-    doc["lightningMaxIntervalMs"] = cfg.lightningMaxIntervalMs;
-    doc["lightningMinLength"]  = cfg.lightningMinLength;
-    doc["lightningMaxLength"]  = cfg.lightningMaxLength;
-    doc["lightningAmbient"]    = cfg.lightningAmbient;
-    doc["autumnLeafMinSize"]   = cfg.autumnLeafMinSize;
-    doc["autumnLeafMaxSize"]   = cfg.autumnLeafMaxSize;
-    doc["autumnLeafRate"]      = cfg.autumnLeafRate;
-    doc["autumnFallMinFrames"] = cfg.autumnFallMinFrames;
-    doc["autumnFallMaxFrames"] = cfg.autumnFallMaxFrames;
-    doc["autumnGustStrength"]  = cfg.autumnGustStrength;
-    doc["autumnGustMinIntervalFrames"] = cfg.autumnGustMinIntervalFrames;
-    doc["autumnGustMaxIntervalFrames"] = cfg.autumnGustMaxIntervalFrames;
-    doc["autumnFlutter"]       = cfg.autumnFlutter;
-    doc["autumnBackground"]    = cfg.autumnBackground;
+    for (const FieldDesc& f : FIELDS) {
+        if (f.store != Store::Zones) valueToJson(doc[flashStr(f.key)], f, cfg);
+    }
 
     // Zone geometry. `length` and `introPixels` are the settable inputs (see
     // configFromJson); `start`/`end` are the derived absolute bounds, echoed for
@@ -309,82 +629,48 @@ bool configFromJson(const JsonDocument& doc, String& err) {
         return false;
     }
 
-    // Scheme, by name (case-insensitive). Validated before any other field is
+    // Enums (scheme), by name (case-insensitive). Validated before any field is
     // touched so a bad name rejects the whole update rather than half-applying it.
-    if (!doc["scheme"].isNull()) {
-        const char* name = doc["scheme"].as<const char*>();
-        int found = -1;
-        for (int s = 0; name && s < SCHEME_COUNT; s++) {
-            if (strcasecmp(name, SCHEME_NAMES[s]) == 0) found = s;
-        }
-        if (found < 0) {
-            err = "scheme must be \"patriotic\", \"halloween\" or \"autumn\"";
+    for (const FieldDesc& f : FIELDS) {
+        if (f.kind != Kind::Enum) continue;
+        JsonVariantConst v = doc[flashStr(f.key)];
+        if (!v.isNull() && enumIndex(f, v.as<const char*>()) < 0) {
+            err = enumError(f);
             return false;
         }
-        cfg.scheme = (uint8_t)found;
     }
 
-    // Brightness is a hard 0-255 range; clamp explicitly since it's a uint8_t.
-    if (doc["brightness"].is<int>()) {
-        int b = doc["brightness"].as<int>();
-        cfg.brightness = (uint8_t)constrain(b, 0, 255);
+    // Scalars: only fields present with a usable type are touched; the raw
+    // values are clamped by sanitize() below. Each type check mirrors what the
+    // field accepts (e.g. a negative number is ignored for an unsigned field).
+    for (const FieldDesc& f : FIELDS) {
+        JsonVariantConst v = doc[flashStr(f.key)];
+        if (v.isNull()) continue;
+        switch (f.store) {
+            case Store::U8:
+                if (f.kind == Kind::Enum) {
+                    member<uint8_t>(cfg, f) = (uint8_t)enumIndex(f, v.as<const char*>());
+                } else if (v.is<int>()) {
+                    // Clamp before narrowing so e.g. 300 becomes 255, not 44.
+                    member<uint8_t>(cfg, f) = (uint8_t)constrain(v.as<int>(), 0, 255);
+                }
+                break;
+            case Store::I32:
+                if (v.is<int>()) member<int32_t>(cfg, f) = v.as<int>();
+                break;
+            case Store::U32:
+                if (v.is<uint32_t>()) member<uint32_t>(cfg, f) = v.as<uint32_t>();
+                break;
+            case Store::F32:
+                if (v.is<float>()) member<float>(cfg, f) = v.as<float>();
+                break;
+            case Store::Bool:
+                if (v.is<bool>()) member<bool>(cfg, f) = v.as<bool>();
+                break;
+            case Store::Zones:
+                break;
+        }
     }
-
-    if (doc["rippleSpeed"].is<float>())  cfg.rippleSpeed  = doc["rippleSpeed"].as<float>();
-    if (doc["rippleWidth"].is<float>())  cfg.rippleWidth  = doc["rippleWidth"].as<float>();
-    if (doc["rippleReturnRatio"].is<float>()) cfg.rippleReturnRatio = doc["rippleReturnRatio"].as<float>();
-    if (doc["rippleMinAmp"].is<float>()) cfg.rippleMinAmp = doc["rippleMinAmp"].as<float>();
-    if (doc["rippleMaxAmp"].is<float>()) cfg.rippleMaxAmp = doc["rippleMaxAmp"].as<float>();
-    if (doc["rippleShade"].is<float>())  cfg.rippleShade  = doc["rippleShade"].as<float>();
-    if (doc["rippleBaseLevel"].is<float>()) cfg.rippleBaseLevel = doc["rippleBaseLevel"].as<float>();
-
-    if (doc["rippleMinIntervalFrames"].is<uint32_t>())
-        cfg.rippleMinIntervalFrames = doc["rippleMinIntervalFrames"].as<uint32_t>();
-    if (doc["rippleMaxIntervalFrames"].is<uint32_t>())
-        cfg.rippleMaxIntervalFrames = doc["rippleMaxIntervalFrames"].as<uint32_t>();
-
-    if (doc["maxRipples"].is<int>())     cfg.maxRipples     = doc["maxRipples"].as<int>();
-    if (doc["stripeWidth"].is<int>())    cfg.stripeWidth    = doc["stripeWidth"].as<int>();
-    if (doc["introStarEvery"].is<int>()) cfg.introStarEvery = doc["introStarEvery"].as<int>();
-    if (doc["introStarMin"].is<int>())   cfg.introStarMin   = doc["introStarMin"].as<int>();
-    if (doc["frameDelayMs"].is<uint32_t>())
-        cfg.frameDelayMs = doc["frameDelayMs"].as<uint32_t>();
-    if (doc["halloweenSectionWidth"].is<int>())
-        cfg.halloweenSectionWidth = doc["halloweenSectionWidth"].as<int>();
-    if (doc["halloweenFadeWidth"].is<int>())
-        cfg.halloweenFadeWidth = doc["halloweenFadeWidth"].as<int>();
-    if (doc["lightningEnabled"].is<bool>())
-        cfg.lightningEnabled = doc["lightningEnabled"].as<bool>();
-    if (doc["lightningMinIntervalMs"].is<uint32_t>())
-        cfg.lightningMinIntervalMs = doc["lightningMinIntervalMs"].as<uint32_t>();
-    if (doc["lightningMaxIntervalMs"].is<uint32_t>())
-        cfg.lightningMaxIntervalMs = doc["lightningMaxIntervalMs"].as<uint32_t>();
-    if (doc["lightningMinLength"].is<int>())
-        cfg.lightningMinLength = doc["lightningMinLength"].as<int>();
-    if (doc["lightningMaxLength"].is<int>())
-        cfg.lightningMaxLength = doc["lightningMaxLength"].as<int>();
-    if (doc["lightningAmbient"].is<int>())
-        cfg.lightningAmbient = doc["lightningAmbient"].as<int>();
-    if (doc["autumnLeafMinSize"].is<int>())
-        cfg.autumnLeafMinSize = doc["autumnLeafMinSize"].as<int>();
-    if (doc["autumnLeafMaxSize"].is<int>())
-        cfg.autumnLeafMaxSize = doc["autumnLeafMaxSize"].as<int>();
-    if (doc["autumnLeafRate"].is<float>())
-        cfg.autumnLeafRate = doc["autumnLeafRate"].as<float>();
-    if (doc["autumnFallMinFrames"].is<uint32_t>())
-        cfg.autumnFallMinFrames = doc["autumnFallMinFrames"].as<uint32_t>();
-    if (doc["autumnFallMaxFrames"].is<uint32_t>())
-        cfg.autumnFallMaxFrames = doc["autumnFallMaxFrames"].as<uint32_t>();
-    if (doc["autumnGustStrength"].is<float>())
-        cfg.autumnGustStrength = doc["autumnGustStrength"].as<float>();
-    if (doc["autumnGustMinIntervalFrames"].is<uint32_t>())
-        cfg.autumnGustMinIntervalFrames = doc["autumnGustMinIntervalFrames"].as<uint32_t>();
-    if (doc["autumnGustMaxIntervalFrames"].is<uint32_t>())
-        cfg.autumnGustMaxIntervalFrames = doc["autumnGustMaxIntervalFrames"].as<uint32_t>();
-    if (doc["autumnFlutter"].is<int>())
-        cfg.autumnFlutter = doc["autumnFlutter"].as<int>();
-    if (doc["autumnBackground"].is<int>())
-        cfg.autumnBackground = doc["autumnBackground"].as<int>();
 
     // Zone geometry. Accept an array positionally aligned with the zones (index 0
     // = zone 0, ...). Only the elements present are touched, and within each only
@@ -409,4 +695,97 @@ bool configFromJson(const JsonDocument& doc, String& err) {
     applyZones();
     applyConfig();
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/schema
+// ---------------------------------------------------------------------------
+
+// Write a numeric limit/step as an int for int fields, as a number otherwise.
+template <typename TDst>
+static void setNumber(TDst&& dst, Kind kind, double v) {
+    if (kind == Kind::Int) dst.set((long)v);
+    else dst.set(v);
+}
+
+static void setLimits(JsonObject o, Kind kind, uint8_t limits, double mn, double mx) {
+    if (limits & HAS_MIN) setNumber(o["min"], kind, mn);
+    if (limits & HAS_MAX) setNumber(o["max"], kind, mx);
+}
+
+// One "fields" entry. Each entry gets its own small, short-lived document so the
+// whole schema never has to sit in RAM at once.
+static void writeFieldSchema(Print& out, const FieldDesc& f) {
+    JsonDocument d;
+    d["key"] = flashStr(f.key);
+    d["label"] = flashStr(f.label);
+    d["group"] = flashStr(GROUPS[f.group].id);
+    d["type"] = flashStr(kindName(f.kind));
+
+    if (f.kind == Kind::Enum) {
+        JsonArray opts = d["options"].to<JsonArray>();
+        for (int i = 0; i < f.optionCount; i++) opts.add(flashStr(f.options[i]));
+        valueToJson(d["default"], f, DEFAULTS);
+    } else if (f.kind == Kind::Array) {
+        d["count"] = KISLAP_NUM_ZONES;
+        d["fixedCount"] = true;
+        JsonArray items = d["items"].to<JsonArray>();
+        for (const ZoneItemDesc& it : ZONE_ITEMS) {
+            JsonObject io = items.add<JsonObject>();
+            io["key"] = flashStr(it.key);
+            io["type"] = "int";
+            if (it.flags & ITEM_READ_ONLY) io["readOnly"] = true;
+            if (it.flags & ITEM_READ_ONLY_ON_LAST) io["readOnlyOnLast"] = true;
+            setLimits(io, Kind::Int, it.limits, it.min, it.max);
+            if (!(it.flags & ITEM_READ_ONLY)) io["step"] = 1;
+            io["unit"] = flashStr(it.unit);
+            io["help"] = flashStr(it.help);
+        }
+        // Compiled-in zone layout (the settable parts).
+        JsonArray def = d["default"].to<JsonArray>();
+        for (int z = 0; z < KISLAP_NUM_ZONES; z++) {
+            JsonObject zo = def.add<JsonObject>();
+            zo["length"] = DEFAULTS.zoneLengths[z];
+            zo["introPixels"] = DEFAULTS.zoneIntros[z];
+        }
+    } else {
+        setLimits(d.as<JsonObject>(), f.kind, f.limits, f.min, f.max);
+        if (f.step > 0) setNumber(d["step"], f.kind, f.step);
+        valueToJson(d["default"], f, DEFAULTS);
+    }
+
+    d["unit"] = flashStr(f.unit);
+    d["help"] = flashStr(f.help);
+    serializeJson(d, out);
+}
+
+void writeConfigSchema(Print& out) {
+    out.print("{\"schemaVersion\":");
+    out.print(KISLAP_SCHEMA_VERSION);
+
+    out.print(",\"schemes\":[");
+    for (int s = 0; s < SCHEME_COUNT; s++) {
+        JsonDocument d;
+        d["name"] = flashStr(SCHEME_NAMES[s]);
+        d["label"] = flashStr(SCHEME_LABELS[s]);
+        if (s > 0) out.print(',');
+        serializeJson(d, out);
+    }
+
+    out.print("],\"groups\":[");
+    for (int g = 0; g < G_COUNT; g++) {
+        JsonDocument d;
+        d["id"] = flashStr(GROUPS[g].id);
+        d["label"] = flashStr(GROUPS[g].label);
+        if (GROUPS[g].scheme >= 0) d["scheme"] = flashStr(SCHEME_NAMES[GROUPS[g].scheme]);
+        if (g > 0) out.print(',');
+        serializeJson(d, out);
+    }
+
+    out.print("],\"fields\":[");
+    for (size_t i = 0; i < FIELD_COUNT; i++) {
+        if (i > 0) out.print(',');
+        writeFieldSchema(out, FIELDS[i]);
+    }
+    out.print("]}");
 }

@@ -4,6 +4,9 @@
 //   GET  /api/config  -> current config as JSON
 //   POST /api/config  -> partial JSON update; persists and echoes new config
 //   GET  /api/status  -> live telemetry: measured fps, uptimeMs, numLeds
+//   GET  /api/schema  -> self-describing settings schema (labels, types,
+//                        limits, defaults, help) so clients can build their UI
+//                        from the device. See README.md.
 //
 // Uses the arduino-esp32 built-in synchronous WebServer, so setupWebApi() must
 // be called once from setup() (after WiFi is connected) and handleWebApi()

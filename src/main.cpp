@@ -136,18 +136,61 @@ static void spawnRipple() {
 // while updating.
 volatile bool otaInProgress = false;
 
-static void connectWiFi() {
-    Serial.printf("Connecting to WiFi '%s'", KISLAP_WIFI_SSID);
+// WiFi is brought up in the background so the lights never wait on it. The
+// first connection attempt after power-on occasionally fails (router slow to
+// answer, weak signal, supply dip as the strand powers up), and the ESP32 often
+// doesn't recover from that on its own. The old blocking connect loop never
+// retried, so such a boot sat dark forever. Now loop() calls maintainWiFi(),
+// which re-issues WiFi.begin() every KISLAP_WIFI_RETRY_MS until connected, and
+// does the same if the connection drops later.
+static const uint32_t KISLAP_WIFI_RETRY_MS = 15000;
+static uint32_t wifiLastAttemptMs = 0;
+static bool wifiWasConnected = false;
+// OTA and the REST API are started once, on the first successful connect.
+static bool networkServicesStarted = false;
+
+static void startWiFi() {
+    Serial.printf("Connecting to WiFi '%s' (in the background)\n", KISLAP_WIFI_SSID);
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(KISLAP_HOSTNAME);
+    WiFi.setAutoReconnect(true);
     WiFi.begin(KISLAP_WIFI_SSID, KISLAP_WIFI_PASSWORD);
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
+    wifiLastAttemptMs = millis();
+}
+
+static void setupOTA();
+
+// Non-blocking: cheap to call every frame.
+static void maintainWiFi() {
+    const bool connected = (WiFi.status() == WL_CONNECTED);
+
+    if (connected) {
+        if (!wifiWasConnected) {
+            wifiWasConnected = true;
+            Serial.print("WiFi connected. IP address: ");
+            Serial.println(WiFi.localIP());
+            if (!networkServicesStarted) {
+                setupOTA();
+                setupWebApi();
+                networkServicesStarted = true;
+            }
+        }
+        return;
     }
-    Serial.println();
-    Serial.print("Connected. IP address: ");
-    Serial.println(WiFi.localIP());
+
+    if (wifiWasConnected) {
+        wifiWasConnected = false;
+        wifiLastAttemptMs = millis();  // give auto-reconnect a full interval first
+        Serial.println("WiFi connection lost; reconnecting in the background.");
+        return;
+    }
+
+    if (millis() - wifiLastAttemptMs >= KISLAP_WIFI_RETRY_MS) {
+        Serial.printf("WiFi still not connected (status %d); retrying.\n", (int)WiFi.status());
+        WiFi.disconnect();
+        WiFi.begin(KISLAP_WIFI_SSID, KISLAP_WIFI_PASSWORD);
+        wifiLastAttemptMs = millis();
+    }
 }
 
 static void setupOTA() {
@@ -215,13 +258,14 @@ void setup() {
 #undef KISLAP_STR2
     FastLED.clear(true);  // blank the strip immediately (writes out all-off once)
 
-    connectWiFi();
-    setupOTA();
-    setupWebApi();
-
     // Pull persisted tunables from NVS (falling back to config.h defaults) and
     // apply them, including FastLED brightness. Must run after addLeds().
     loadConfig();
+
+    // Start connecting, but don't wait: the scheme starts rendering right away,
+    // and loop() finishes the connection (and starts OTA + the REST API) whenever
+    // the network comes up. See maintainWiFi().
+    startWiFi();
 
     // Seed the RNG so ripple timing and strength differ run to run.
     randomSeed(esp_random());
@@ -716,8 +760,11 @@ static void renderAutumn() {
 }
 
 void loop() {
-    ArduinoOTA.handle();
-    handleWebApi();
+    maintainWiFi();
+    if (networkServicesStarted) {
+        ArduinoOTA.handle();
+        handleWebApi();
+    }
 
     // While updating, do nothing but service OTA so the upload isn't disrupted.
     if (otaInProgress) {
