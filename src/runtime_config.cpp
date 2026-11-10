@@ -52,6 +52,8 @@ static const char* NVS_NAMESPACE = "kislap";
 namespace keys {
     constexpr const char* zoneLengths = "zonelen";
     constexpr const char* zoneIntros = "zoneintro";
+    // Burnt LED list: burntLedCount followed by the whole burntLeds[] array.
+    constexpr const char* burntLeds = "burnt";
 }
 
 // JSON names for each Scheme, indexed by its enum value. configFromJson
@@ -87,7 +89,7 @@ namespace {
 enum class Kind : uint8_t { Int, Float, Bool, Enum, String, Array };
 
 // How a setting is stored in Config (and NVS).
-enum class Store : uint8_t { U8, I32, U32, F32, Bool, Zones };
+enum class Store : uint8_t { U8, I32, U32, F32, Bool, Zones, Burnt };
 
 // Store tag for a Config member's C++ type, so a row can't claim the wrong one.
 template <typename T> struct StoreOf;
@@ -100,7 +102,8 @@ template <> struct StoreOf<bool>     { static constexpr Store value = Store::Boo
 // Settings groups shown by clients. A group tied to a scheme only matters while
 // that scheme is selected; groups with no scheme always apply.
 enum Group : uint8_t {
-    G_GENERAL, G_PATRIOTIC, G_RIPPLES, G_HALLOWEEN, G_LIGHTNING, G_AUTUMN, G_COUNT
+    G_GENERAL, G_PATRIOTIC, G_RIPPLES, G_HALLOWEEN, G_LIGHTNING, G_AUTUMN,
+    G_BURNT, G_COUNT
 };
 
 struct GroupDesc {
@@ -116,6 +119,7 @@ constexpr GroupDesc GROUPS[] = {
     { "halloween", "Halloween",    SCHEME_HALLOWEEN },
     { "lightning", "Lightning",    SCHEME_HALLOWEEN },
     { "autumn",    "Autumn",       SCHEME_AUTUMN },
+    { "burnt",     "Burnt LEDs",   -1 },
 };
 static_assert(sizeof(GROUPS) / sizeof(GROUPS[0]) == G_COUNT,
               "GROUPS needs exactly one entry per Group value");
@@ -303,14 +307,37 @@ constexpr FieldDesc FIELDS[] = {
     FIELD(autumnBackground, Int, "atbg", G_AUTUMN, "Background",
         LIM_RANGE(0, 255), 1, "",
         "Brightness of the dim backdrop between leaves (0 = black)."),
+    FIELD(autumnGreenPercent, Int, "atgreen", G_AUTUMN, "Green leaves",
+        LIM_RANGE(0, 100), 1, "%",
+        "Share of new leaves that are still green instead of a fall color "
+        "(0 = none)."),
+
+    FIELD(burntTolerance, Int, "burnttol", G_BURNT, "Color tolerance",
+        LIM_RANGE(0, 100), 1, "%",
+        "How much of a dead color a burnt LED may be asked to show, as a "
+        "percent of the color's strongest part, and still light up (0 = any "
+        "amount of a dead color turns it off)."),
+    // burntLedCount + burntLeds, shown to clients as one "burntLeds" array of
+    // objects. Its JSON, NVS and cleanup are handled by hand (see
+    // configToJson, configFromJson, loadConfig, sanitize); its items are
+    // described by BURNT_ITEMS below.
+    { "burntLeds", nullptr, "Burnt LEDs", "",
+      "Damaged LEDs and which of their colors still work; each one lights only "
+      "when it can show the color it is given, and stays off otherwise. "
+      "Sending this list replaces the whole list.",
+      nullptr, 0,
+      (uint16_t)offsetof(Config, burntLedCount),
+      (uint16_t)(sizeof(Config::burntLedCount) + sizeof(Config::burntLeds)),
+      Kind::Array, Store::Burnt, G_BURNT, LIM_NONE, 0 },
 };
 
 constexpr size_t FIELD_COUNT = sizeof(FIELDS) / sizeof(FIELDS[0]);
 
-// Items of each "zones" array element, in /api/config order.
+// Items of each element of an array setting, in /api/config order.
 enum : uint8_t { ITEM_READ_ONLY = 1, ITEM_READ_ONLY_ON_LAST = 2 };
-struct ZoneItemDesc {
+struct ItemDesc {
     const char* key;
+    Kind kind;
     uint8_t flags;
     uint8_t limits;
     double min;
@@ -318,18 +345,32 @@ struct ZoneItemDesc {
     const char* unit;
     const char* help;
 };
-constexpr ZoneItemDesc ZONE_ITEMS[] = {
-    { "start", ITEM_READ_ONLY, LIM_NONE, "px",
+constexpr ItemDesc ZONE_ITEMS[] = {
+    { "start", Kind::Int, ITEM_READ_ONLY, LIM_NONE, "px",
       "First LED of the zone (worked out from the zone lengths)." },
-    { "end", ITEM_READ_ONLY, LIM_NONE, "px",
+    { "end", Kind::Int, ITEM_READ_ONLY, LIM_NONE, "px",
       "One past the last LED of the zone (worked out from the zone lengths)." },
-    { "length", ITEM_READ_ONLY_ON_LAST, LIM_RANGE(1, ZONE_MAX_PIXELS), "px",
+    { "length", Kind::Int, ITEM_READ_ONLY_ON_LAST, LIM_RANGE(1, ZONE_MAX_PIXELS), "px",
       "LEDs in the zone; each earlier zone leaves at least one LED for every "
       "zone after it, and the last zone gets whatever is left." },
-    { "introPixels", 0, LIM_RANGE(0, ZONE_MAX_PIXELS), "px",
+    { "introPixels", Kind::Int, 0, LIM_RANGE(0, ZONE_MAX_PIXELS), "px",
       "LEDs at the start of the zone that form the blue/star intro; capped at "
       "the zone's length." },
 };
+constexpr ItemDesc BURNT_ITEMS[] = {
+    { "pixel", Kind::Int, 0, LIM_RANGE(0, KISLAP_NUM_LEDS - 1), "",
+      "Position of the LED on the strip, counting from 0." },
+    { "red", Kind::Bool, 0, LIM_NONE, "",
+      "Whether the LED's red still works (left out = dead)." },
+    { "green", Kind::Bool, 0, LIM_NONE, "",
+      "Whether the LED's green still works (left out = dead)." },
+    { "blue", Kind::Bool, 0, LIM_NONE, "",
+      "Whether the LED's blue still works (left out = dead)." },
+};
+
+// JSON item key for each color flag, in KISLAP_LED_R/G/B order.
+constexpr uint8_t BURNT_COLOR_FLAGS[] = { KISLAP_LED_R, KISLAP_LED_G, KISLAP_LED_B };
+constexpr const char* const BURNT_COLOR_KEYS[] = { "red", "green", "blue" };
 
 #undef FIELD
 #undef ENUM_FIELD
@@ -359,6 +400,9 @@ constexpr bool rowsCoverConfig(size_t i, size_t end) {
 static_assert(offsetof(Config, zoneIntros) ==
                   offsetof(Config, zoneLengths) + sizeof(Config::zoneLengths),
               "zoneIntros must directly follow zoneLengths in Config");
+static_assert(offsetof(Config, burntLeds) ==
+                  offsetof(Config, burntLedCount) + sizeof(Config::burntLedCount),
+              "burntLeds must directly follow burntLedCount in Config");
 static_assert(rowsCoverConfig(0, 0),
               "FIELDS in runtime_config.cpp is out of sync with "
               "Config: every member needs exactly one row, in declaration order");
@@ -368,7 +412,7 @@ constexpr bool kindFitsStore(Kind k, Store s) {
          : k == Kind::Float ? s == Store::F32
          : k == Kind::Bool  ? s == Store::Bool
          : k == Kind::Enum  ? s == Store::U8
-         : k == Kind::Array ? s == Store::Zones
+         : k == Kind::Array ? (s == Store::Zones || s == Store::Burnt)
          : false;
 }
 constexpr bool kindsFit(size_t i) {
@@ -391,11 +435,11 @@ constexpr bool noDupAfter(size_t i, size_t j) {
            (!strEq(FIELDS[i].key, FIELDS[j].key) &&
             !strEq(FIELDS[i].nvsKey, FIELDS[j].nvsKey) && noDupAfter(i, j + 1));
 }
-// Every NVS key fits the 15-char limit and doesn't collide with the zone blobs.
+// Every NVS key fits the 15-char limit and doesn't collide with the array blobs.
 constexpr bool nvsKeyOk(const char* k) {
     return k == nullptr ||
            (strLen(k) <= 15 && !strEq(k, keys::zoneLengths) &&
-            !strEq(k, keys::zoneIntros));
+            !strEq(k, keys::zoneIntros) && !strEq(k, keys::burntLeds));
 }
 constexpr bool keysUnique(size_t i) {
     return i == FIELD_COUNT ||
@@ -442,6 +486,7 @@ void clampField(const FieldDesc& f) {
         case Store::F32: member<float>(cfg, f)    = clampToRow(member<float>(cfg, f), f); break;
         case Store::Bool:
         case Store::Zones:
+        case Store::Burnt:
             break;
     }
 }
@@ -480,6 +525,18 @@ void valueToJson(TDst&& dst, const FieldDesc& f, const Config& c) {
         case Store::F32:  dst.set(member<float>(c, f)); break;
         case Store::Bool: dst.set(member<bool>(c, f)); break;
         case Store::Zones: break;
+        case Store::Burnt: break;
+    }
+}
+
+// Write a burnt LED list as [{ "pixel", "red", "green", "blue" }, ...].
+void burntLedsToJson(JsonArray arr, const BurntLed* list, int32_t count) {
+    for (int32_t k = 0; k < count; k++) {
+        JsonObject o = arr.add<JsonObject>();
+        o["pixel"] = list[k].pixel;
+        for (int c = 0; c < 3; c++) {
+            o[flashStr(BURNT_COLOR_KEYS[c])] = (list[k].works & BURNT_COLOR_FLAGS[c]) != 0;
+        }
     }
 }
 
@@ -542,11 +599,39 @@ static void sanitize() {
     if (cfg.halloweenFadeWidth > cfg.halloweenSectionWidth / 2) {
         cfg.halloweenFadeWidth = cfg.halloweenSectionWidth / 2;
     }
+
+    // Burnt LEDs: drop pixels past the end of the strip, sort by pixel, and keep
+    // only the last entry given for a repeated pixel.
+    cfg.burntLedCount = constrain(cfg.burntLedCount, (int32_t)0, (int32_t)KISLAP_MAX_BURNT_LEDS);
+    int32_t n = 0;
+    for (int32_t k = 0; k < cfg.burntLedCount; k++) {
+        BurntLed b = cfg.burntLeds[k];
+        if (b.pixel >= KISLAP_NUM_LEDS) continue;
+        b.works &= (KISLAP_LED_R | KISLAP_LED_G | KISLAP_LED_B);
+        // Insertion sort into the kept prefix [0, n).
+        int32_t j = n;
+        while (j > 0 && cfg.burntLeds[j - 1].pixel > b.pixel) {
+            cfg.burntLeds[j] = cfg.burntLeds[j - 1];
+            j--;
+        }
+        if (j > 0 && cfg.burntLeds[j - 1].pixel == b.pixel) {
+            // Repeat: replace the earlier entry and undo the shift.
+            cfg.burntLeds[j - 1] = b;
+            for (int32_t m = j; m < n; m++) cfg.burntLeds[m] = cfg.burntLeds[m + 1];
+            continue;
+        }
+        cfg.burntLeds[j] = b;
+        n++;
+    }
+    cfg.burntLedCount = n;
+    for (int32_t k = n; k < KISLAP_MAX_BURNT_LEDS; k++) cfg.burntLeds[k] = BurntLed{0, 0};
 }
 
 void applyConfig() {
     FastLED.setBrightness(cfg.brightness);
 }
+
+static const size_t BURNT_BLOB_SIZE = sizeof(Config::burntLedCount) + sizeof(Config::burntLeds);
 
 void loadConfig() {
     prefs.begin(NVS_NAMESPACE, /*readOnly=*/true);
@@ -569,6 +654,7 @@ void loadConfig() {
                 member<bool>(cfg, f) = prefs.getBool(f.nvsKey, member<bool>(cfg, f));
                 break;
             case Store::Zones:
+            case Store::Burnt:
                 break;
         }
     }
@@ -581,6 +667,11 @@ void loadConfig() {
         prefs.getBytes(keys::zoneLengths, cfg.zoneLengths, sizeof(cfg.zoneLengths));
     if (prefs.getBytesLength(keys::zoneIntros) == sizeof(cfg.zoneIntros))
         prefs.getBytes(keys::zoneIntros, cfg.zoneIntros, sizeof(cfg.zoneIntros));
+    // Burnt LEDs: one blob holding burntLedCount and the whole burntLeds[] array,
+    // so an empty list is still saved. Same exact-size rule as the zones (a
+    // KISLAP_MAX_BURNT_LEDS change falls back to the compiled-in list).
+    if (prefs.getBytesLength(keys::burntLeds) == BURNT_BLOB_SIZE)
+        prefs.getBytes(keys::burntLeds, &cfg.burntLedCount, BURNT_BLOB_SIZE);
     prefs.end();
 
     sanitize();
@@ -598,16 +689,18 @@ void saveConfig() {
             case Store::F32:  prefs.putFloat(f.nvsKey, member<float>(cfg, f)); break;
             case Store::Bool: prefs.putBool(f.nvsKey, member<bool>(cfg, f)); break;
             case Store::Zones: break;
+            case Store::Burnt: break;
         }
     }
     prefs.putBytes(keys::zoneLengths, cfg.zoneLengths, sizeof(cfg.zoneLengths));
     prefs.putBytes(keys::zoneIntros,  cfg.zoneIntros,  sizeof(cfg.zoneIntros));
+    prefs.putBytes(keys::burntLeds, &cfg.burntLedCount, BURNT_BLOB_SIZE);
     prefs.end();
 }
 
 void configToJson(JsonDocument& doc) {
     for (const FieldDesc& f : FIELDS) {
-        if (f.store != Store::Zones) valueToJson(doc[flashStr(f.key)], f, cfg);
+        if (f.kind != Kind::Array) valueToJson(doc[flashStr(f.key)], f, cfg);
     }
 
     // Zone geometry. `length` and `introPixels` are the settable inputs (see
@@ -621,6 +714,8 @@ void configToJson(JsonDocument& doc) {
         zo["length"] = zones[z].end - zones[z].start;
         zo["introPixels"] = zones[z].introPixels;
     }
+
+    burntLedsToJson(doc["burntLeds"].to<JsonArray>(), cfg.burntLeds, cfg.burntLedCount);
 }
 
 bool configFromJson(const JsonDocument& doc, String& err) {
@@ -637,6 +732,31 @@ bool configFromJson(const JsonDocument& doc, String& err) {
         if (!v.isNull() && enumIndex(f, v.as<const char*>()) < 0) {
             err = enumError(f);
             return false;
+        }
+    }
+
+    // Burnt LEDs, also checked up front: the list is replaced as a whole, so a
+    // bad entry rejects the update instead of silently dropping that LED.
+    JsonVariantConst burntV = doc["burntLeds"];
+    if (!burntV.isNull()) {
+        if (!burntV.is<JsonArrayConst>()) {
+            err = "burntLeds must be an array";
+            return false;
+        }
+        JsonArrayConst arr = burntV.as<JsonArrayConst>();
+        if (arr.size() > KISLAP_MAX_BURNT_LEDS) {
+            err = "burntLeds can list at most " + String(KISLAP_MAX_BURNT_LEDS) + " LEDs";
+            return false;
+        }
+        for (JsonVariantConst e : arr) {
+            const bool ok = e.is<JsonObjectConst>() && e["pixel"].is<int>() &&
+                            e["pixel"].as<int>() >= 0 &&
+                            e["pixel"].as<int>() < KISLAP_NUM_LEDS;
+            if (!ok) {
+                err = "each burntLeds entry needs a \"pixel\" from 0 to " +
+                      String(KISLAP_NUM_LEDS - 1);
+                return false;
+            }
         }
     }
 
@@ -668,8 +788,23 @@ bool configFromJson(const JsonDocument& doc, String& err) {
                 if (v.is<bool>()) member<bool>(cfg, f) = v.as<bool>();
                 break;
             case Store::Zones:
+            case Store::Burnt:
                 break;
         }
+    }
+
+    // Burnt LEDs (validated above): replace the whole list. A color left out
+    // counts as dead, so {"pixel": 12} marks a completely dead LED.
+    if (!burntV.isNull()) {
+        int32_t n = 0;
+        for (JsonVariantConst e : burntV.as<JsonArrayConst>()) {
+            BurntLed b{ (uint16_t)e["pixel"].as<int>(), 0 };
+            for (int c = 0; c < 3; c++) {
+                if (e[flashStr(BURNT_COLOR_KEYS[c])].as<bool>()) b.works |= BURNT_COLOR_FLAGS[c];
+            }
+            cfg.burntLeds[n++] = b;
+        }
+        cfg.burntLedCount = n;
     }
 
     // Zone geometry. Accept an array positionally aligned with the zones (index 0
@@ -727,26 +862,40 @@ static void writeFieldSchema(Print& out, const FieldDesc& f) {
         for (int i = 0; i < f.optionCount; i++) opts.add(flashStr(f.options[i]));
         valueToJson(d["default"], f, DEFAULTS);
     } else if (f.kind == Kind::Array) {
-        d["count"] = KISLAP_NUM_ZONES;
-        d["fixedCount"] = true;
+        const bool zonesArr = (f.store == Store::Zones);
+        if (zonesArr) {
+            d["count"] = KISLAP_NUM_ZONES;
+            d["fixedCount"] = true;
+        } else {
+            d["maxCount"] = KISLAP_MAX_BURNT_LEDS;
+            d["fixedCount"] = false;
+        }
         JsonArray items = d["items"].to<JsonArray>();
-        for (const ZoneItemDesc& it : ZONE_ITEMS) {
+        const ItemDesc* itemTable = zonesArr ? ZONE_ITEMS : BURNT_ITEMS;
+        const size_t itemCount = zonesArr ? sizeof(ZONE_ITEMS) / sizeof(ZONE_ITEMS[0])
+                                          : sizeof(BURNT_ITEMS) / sizeof(BURNT_ITEMS[0]);
+        for (size_t i = 0; i < itemCount; i++) {
+            const ItemDesc& it = itemTable[i];
             JsonObject io = items.add<JsonObject>();
             io["key"] = flashStr(it.key);
-            io["type"] = "int";
+            io["type"] = flashStr(kindName(it.kind));
             if (it.flags & ITEM_READ_ONLY) io["readOnly"] = true;
             if (it.flags & ITEM_READ_ONLY_ON_LAST) io["readOnlyOnLast"] = true;
-            setLimits(io, Kind::Int, it.limits, it.min, it.max);
-            if (!(it.flags & ITEM_READ_ONLY)) io["step"] = 1;
+            setLimits(io, it.kind, it.limits, it.min, it.max);
+            if (it.kind == Kind::Int && !(it.flags & ITEM_READ_ONLY)) io["step"] = 1;
             io["unit"] = flashStr(it.unit);
             io["help"] = flashStr(it.help);
         }
-        // Compiled-in zone layout (the settable parts).
         JsonArray def = d["default"].to<JsonArray>();
-        for (int z = 0; z < KISLAP_NUM_ZONES; z++) {
-            JsonObject zo = def.add<JsonObject>();
-            zo["length"] = DEFAULTS.zoneLengths[z];
-            zo["introPixels"] = DEFAULTS.zoneIntros[z];
+        if (zonesArr) {
+            // Compiled-in zone layout (the settable parts).
+            for (int z = 0; z < KISLAP_NUM_ZONES; z++) {
+                JsonObject zo = def.add<JsonObject>();
+                zo["length"] = DEFAULTS.zoneLengths[z];
+                zo["introPixels"] = DEFAULTS.zoneIntros[z];
+            }
+        } else {
+            burntLedsToJson(def, DEFAULTS.burntLeds, DEFAULTS.burntLedCount);
         }
     } else {
         setLimits(d.as<JsonObject>(), f.kind, f.limits, f.min, f.max);

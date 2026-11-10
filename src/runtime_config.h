@@ -33,6 +33,20 @@ void initZones();
 // loading NVS and after every config update that can touch zone geometry.
 void applyZones();
 
+// A damaged LED (see "Burnt LEDs" in config.h): its pixel index and which of
+// its color elements still work (KISLAP_LED_R/G/B flags).
+struct BurntLed {
+    uint16_t pixel;
+    uint8_t  works;
+};
+
+// The compiled-in burnt LED list for this strand, used to seed Config.
+constexpr BurntLed BURNT_LED_DEFAULTS[] = KISLAP_BURNT_LEDS;
+constexpr int32_t BURNT_LED_DEFAULT_COUNT =
+    (int32_t)(sizeof(BURNT_LED_DEFAULTS) / sizeof(BurntLed));
+static_assert(BURNT_LED_DEFAULT_COUNT <= KISLAP_MAX_BURNT_LEDS,
+              "KISLAP_BURNT_LEDS lists more LEDs than KISLAP_MAX_BURNT_LEDS");
+
 // Selectable display schemes (see KISLAP_DEFAULT_SCHEME in config.h). The
 // numeric value is persisted to NVS, so append new schemes rather than
 // renumbering existing ones.
@@ -132,6 +146,16 @@ struct Config {
     uint32_t autumnGustMaxIntervalFrames = KISLAP_AUTUMN_GUST_MAX_INTERVAL_FRAMES;
     int32_t  autumnFlutter           = KISLAP_AUTUMN_FLUTTER;
     int32_t  autumnBackground        = KISLAP_AUTUMN_BACKGROUND;
+    int32_t  autumnGreenPercent      = KISLAP_AUTUMN_GREEN_PERCENT;
+
+    // Burnt LEDs (see config.h). A listed pixel shows its color only when the
+    // dead elements' share of it is within burntTolerance percent of its
+    // brightest element; otherwise it is turned off. Only the first
+    // burntLedCount entries are used; sanitize() keeps them sorted by pixel,
+    // unique, and on the strip.
+    int32_t  burntTolerance          = KISLAP_BURNT_TOLERANCE;
+    int32_t  burntLedCount           = BURNT_LED_DEFAULT_COUNT;
+    BurntLed burntLeds[KISLAP_MAX_BURNT_LEDS] = KISLAP_BURNT_LEDS;
 };
 
 // The single live config instance, defined in runtime_config.cpp.

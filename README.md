@@ -24,6 +24,10 @@ LED settings are centralized in `src/config.h`:
 - `KISLAP_NUM_LEDS` — count of LEDs
 - `KISLAP_LED_TYPE` / `KISLAP_COLOR_ORDER` — LED chipset configuration
 - `KISLAP_BRIGHTNESS` — default brightness
+- `KISLAP_BURNT_LEDS` — per strand, the starting list of damaged pixels and
+  which of their colors still work, e.g.
+  `{ { 57, KISLAP_LED_R | KISLAP_LED_B }, { 980, KISLAP_LED_NONE } }`. Normally
+  you manage this list over the REST API instead (`burntLeds`, below).
 
 Customize these values in `src/config.h`, and keep `src/main.cpp` for your animation logic.
 
@@ -80,12 +84,15 @@ compiled-in defaults):
   "autumnGustMaxIntervalFrames": 300,
   "autumnFlutter": 120,
   "autumnBackground": 60,
+  "autumnGreenPercent": 8,
+  "burntTolerance": 10,
   "zones": [
     { "start": 0,    "end": 639,  "length": 639, "introPixels": 110 },
     { "start": 639,  "end": 872,  "length": 233, "introPixels": 60 },
     { "start": 872,  "end": 1263, "length": 391, "introPixels": 100 },
     { "start": 1263, "end": 1521, "length": 258, "introPixels": 60 }
-  ]
+  ],
+  "burntLeds": []
 }
 ```
 
@@ -109,8 +116,30 @@ curl -X POST http://<device-ip>/api/config \
 # -> full config, with "scheme": "autumn", "brightness": 255 (clamped), ...
 ```
 
+`burntLeds` lists damaged LEDs and which of their colors still work. Unlike
+`zones`, sending it **replaces the whole list** (send `[]` to clear it), so to
+add one LED, GET the list, add to it, and POST it back. In each entry, a color
+that's left out counts as dead, so `{"pixel": 980}` is a completely dead LED.
+The list comes back sorted by pixel, with one entry per pixel (the last one sent
+wins). It holds at most 64 LEDs (`KISLAP_MAX_BURNT_LEDS`).
+
+A listed LED lights only when its working colors can show the color it's given,
+and stays off otherwise. `burntTolerance` (0-100, default 10) is how much of a
+dead color is ignored, as a percent of the color's strongest part. At 10, a red
+with a trace of green (`0xC00700`) still shows on an LED whose green is dead,
+but orange or white turns it off. At 0, any amount of a dead color turns it off.
+
+```sh
+curl -X POST http://<device-ip>/api/config      -H "Content-Type: application/json"      -d '{"burntLeds": [
+           {"pixel": 57,  "red": true, "blue": true},
+           {"pixel": 412, "green": true},
+           {"pixel": 980}
+         ]}'
+```
+
 The request is rejected with a 400 and nothing is changed if the body isn't a
-JSON object or `scheme` isn't a known name:
+JSON object, `scheme` isn't a known name, or `burntLeds` isn't an array of up
+to 64 entries that each have a `pixel` on the strip:
 
 ```json
 { "error": "scheme must be \"patriotic\", \"halloween\" or \"autumn\"" }
@@ -162,7 +191,8 @@ Each field has:
 | `unit`    | `px`, `ms`, `frames`, `px/frame`, `leaves/frame`, or `""` |
 | `help`    | One-sentence description, including any rule that involves another setting (e.g. "raised to Min gap if set lower") |
 | `options` | `enum` only: the allowed values |
-| `count`, `fixedCount`, `items` | `array` only: number of elements, whether that number can change, and the keys of each element. Item flags: `readOnly` (never settable), `readOnlyOnLast` (not settable on the last element) |
+| `count`, `fixedCount`, `items` | `array` only: number of elements, whether that number can change, and the keys of each element (each with its own `type`). Item flags: `readOnly` (never settable), `readOnlyOnLast` (not settable on the last element) |
+| `maxCount` | `array` with `fixedCount: false` only (e.g. `burntLeds`): most elements allowed. Such an array is replaced as a whole when sent |
 
 Example (shortened; the real response lists every setting):
 
@@ -180,7 +210,8 @@ Example (shortened; the real response lists every setting):
     { "id": "ripples",   "label": "Wind ripples", "scheme": "patriotic" },
     { "id": "halloween", "label": "Halloween",    "scheme": "halloween" },
     { "id": "lightning", "label": "Lightning",    "scheme": "halloween" },
-    { "id": "autumn",    "label": "Autumn",       "scheme": "autumn" }
+    { "id": "autumn",    "label": "Autumn",       "scheme": "autumn" },
+    { "id": "burnt",     "label": "Burnt LEDs" }
   ],
   "fields": [
     { "key": "scheme", "label": "Scheme", "group": "general", "type": "enum",
@@ -207,7 +238,17 @@ Example (shortened; the real response lists every setting):
         { "length": 639, "introPixels": 110 }, { "length": 233, "introPixels": 60 },
         { "length": 391, "introPixels": 100 }, { "length": 258, "introPixels": 60 }
       ],
-      "unit": "", "help": "Each zone covers one side of the house: ..." }
+      "unit": "", "help": "Each zone covers one side of the house: ..." },
+    { "key": "burntLeds", "label": "Burnt LEDs", "group": "burnt", "type": "array",
+      "maxCount": 64, "fixedCount": false,
+      "items": [
+        { "key": "pixel", "type": "int", "min": 0, "max": 1520, "step": 1, "unit": "", "help": "Position of the LED on the strip, counting from 0." },
+        { "key": "red", "type": "bool", "unit": "", "help": "Whether the LED's red still works (left out = dead)." },
+        { "key": "green", "type": "bool", "unit": "", "help": "Whether the LED's green still works (left out = dead)." },
+        { "key": "blue", "type": "bool", "unit": "", "help": "Whether the LED's blue still works (left out = dead)." }
+      ],
+      "default": [],
+      "unit": "", "help": "Damaged LEDs and which of their colors still work; ..." }
   ]
 }
 ```

@@ -21,15 +21,52 @@
     // TODO: set once the prod board is on the network (see the serial
     // monitor at boot), and update upload_port in platformio.ini to match.
     #define KISLAP_HOSTNAME "192.168.68.180"
+    // Damaged LEDs on this strand (see "Burnt LEDs" below).
+    #define KISLAP_BURNT_LEDS { }
 #elif defined(KISLAP_PROFILE_DEV)
     // Dev: WS2815 driver IC (12V, single-wire WS2812-style protocol), native
     // GRB color order.
     #define KISLAP_LED_TYPE WS2815
     #define KISLAP_COLOR_ORDER GRB
     #define KISLAP_HOSTNAME "192.168.68.179"
+    // Damaged LEDs on this strand (see "Burnt LEDs" below).
+    #define KISLAP_BURNT_LEDS { }
 #else
     #error "Define KISLAP_PROFILE_DEV or KISLAP_PROFILE_PROD (see platformio.ini environments)"
 #endif
+
+// --- Burnt LEDs --------------------------------------------------------------
+// Some LEDs on a strand are damaged: either completely dead, or with one or two
+// of their red/green/blue elements dead, so they can't show every color. The
+// list is normally managed live over the REST API ("burntLeds" and
+// "burntTolerance"; see README.md) and saved to NVS. KISLAP_BURNT_LEDS above is
+// only the starting list for a device that has never saved its config, given
+// per strand as { pixel, colors that still work }:
+//
+//     #define KISLAP_BURNT_LEDS { \
+//         { 57,  KISLAP_LED_R | KISLAP_LED_B }, /* green is dead */      \
+//         { 412, KISLAP_LED_G },                /* only green works */   \
+//         { 980, KISLAP_LED_NONE },             /* completely dead */    \
+//     }
+//
+// Pixel numbers count from 0 at the start of the strand. Colors are named as the
+// animation sees them (KISLAP_COLOR_ORDER is already applied), so run the boot
+// self-test first if a strand's color order isn't confirmed yet.
+//
+// Every frame, each listed pixel shows its color only if it can display it with
+// the elements that still work; otherwise it is turned off. A color counts as
+// displayable when every dead element's share of it is at most
+// KISLAP_BURNT_TOLERANCE percent of the color's brightest element. That lets a
+// red with a trace of green (e.g. 0xC00700) still show on a pixel whose green is
+// dead, while orange or white on that pixel goes dark. 0 = strict: any amount of
+// a dead color turns the pixel off.
+#define KISLAP_LED_NONE 0x0
+#define KISLAP_LED_R    0x1
+#define KISLAP_LED_G    0x2
+#define KISLAP_LED_B    0x4
+#define KISLAP_BURNT_TOLERANCE 10
+// Most burnt LEDs that can be listed. Sizes an array, so compile-time only.
+#define KISLAP_MAX_BURNT_LEDS 64
 
 // --- Runtime-tunable defaults ----------------------------------------------
 // The values below seed the runtime Config (see runtime_config.h) at first
@@ -52,7 +89,7 @@
 //                       "Zones", "Intro section" and "Ripple effect" below).
 //   SCHEME_HALLOWEEN -- alternating dark green / deep purple sections with
 //                       faded ends (see "Halloween scheme" below).
-//   SCHEME_AUTUMN    -- red/orange/yellow/brown leaves falling and blowing
+//   SCHEME_AUTUMN    -- red/orange/yellow/brown (and a few green) leaves falling and blowing
 //                       across the strip as if seen through a long slit,
 //                       tumbling and flickering, with occasional gusts (see
 //                       "Autumn scheme" below).
@@ -113,15 +150,19 @@
 // Palette colors, picked to read correctly on LEDs (brown is a dim orange, and
 // "light yellow" is a warm yellow so it doesn't look green or white). Each leaf
 // gets a random color from (or between) these.
-#define KISLAP_AUTUMN_RED    0xB00800
+#define KISLAP_AUTUMN_RED    0xC00700
 #define KISLAP_AUTUMN_ORANGE 0xFF3800
 #define KISLAP_AUTUMN_YELLOW 0xFFA020
 #define KISLAP_AUTUMN_BROWN  0x3A1404
+// A few leaves haven't turned yet: this percent of new leaves (0-100) are green
+// instead of a fall color. 0 = all fall colors.
+#define KISLAP_AUTUMN_GREEN  0x2A8000
+#define KISLAP_AUTUMN_GREEN_PERCENT 8
 // Color a leaf's back side is lightened toward (leaf undersides are paler).
 #define KISLAP_AUTUMN_UNDERSIDE 0xFFC060
 // Dim backdrop showing through the gaps between leaves. The color is fixed; its
 // level (0-255, 0 = gaps are black) is KISLAP_AUTUMN_BACKGROUND.
-#define KISLAP_AUTUMN_BACKGROUND_COLOR 0x401204
+#define KISLAP_AUTUMN_BACKGROUND_COLOR 0x402004
 #define KISLAP_AUTUMN_BACKGROUND 60
 
 // Leaf width range (pixels) at the leaf's widest point. Each leaf picks a random

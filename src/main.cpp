@@ -131,6 +131,29 @@ static void spawnRipple() {
     }
 }
 
+// Run on the finished frame, just before it is sent. Each burnt LED listed in
+// cfg (see "Burnt LEDs" in config.h) keeps its color if its working elements
+// can show it (dead elements are within cfg.burntTolerance percent of the
+// brightest one), and is turned off otherwise. Every scheme redraws all of
+// leds[] each frame, so changing pixels here never leaks into the next frame.
+static void maskBurntLeds() {
+    for (int32_t k = 0; k < cfg.burntLedCount; k++) {
+        const BurntLed& b = cfg.burntLeds[k];
+        if (b.pixel >= KISLAP_NUM_LEDS) {
+            continue;
+        }
+        CRGB& c = leds[b.pixel];
+        const uint8_t peak = max(c.r, max(c.g, c.b));
+        uint8_t lost = 0;  // brightest dead element this color needs
+        if (!(b.works & KISLAP_LED_R)) { lost = max(lost, c.r); c.r = 0; }
+        if (!(b.works & KISLAP_LED_G)) { lost = max(lost, c.g); c.g = 0; }
+        if (!(b.works & KISLAP_LED_B)) { lost = max(lost, c.b); c.b = 0; }
+        if ((uint32_t)lost * 100 > (uint32_t)peak * (uint32_t)cfg.burntTolerance) {
+            c = CRGB::Black;
+        }
+    }
+}
+
 // Set while an OTA update is in flight. FastLED.show() disables interrupts to
 // bit-bang LED timing, which drops WiFi packets and breaks OTA; pause rendering
 // while updating.
@@ -271,6 +294,8 @@ void setup() {
     randomSeed(esp_random());
     nextRippleFrame = random(cfg.rippleMinIntervalFrames,
                              cfg.rippleMaxIntervalFrames + 1);
+
+    Serial.printf("Burnt LEDs masked: %d\n", (int)cfg.burntLedCount);
 
     Serial.println("Kislap firmware starting with FastLED...");
 }
@@ -656,7 +681,13 @@ static void spawnLeaf() {
         l.tumble = random(0, 628) / 100.0f;
         // 0.10 .. 0.30 radians per frame, spinning either way.
         l.tumbleRate = (0.10f + random(0, 201) / 1000.0f) * (random(2) ? 1.0f : -1.0f);
-        l.front = ColorFromPalette(autumnPalette, random8(), 255, LINEARBLEND);
+        if (random(0, 100) < cfg.autumnGreenPercent) {
+            // A leaf that hasn't turned yet; vary its shade a little.
+            l.front = CRGB(KISLAP_AUTUMN_GREEN);
+            l.front.nscale8_video(170 + random8(86));
+        } else {
+            l.front = ColorFromPalette(autumnPalette, random8(), 255, LINEARBLEND);
+        }
         l.back = blend(l.front, CRGB(KISLAP_AUTUMN_UNDERSIDE), 110);
         l.seed = random8();
         l.active = true;
@@ -785,6 +816,7 @@ void loop() {
             break;
     }
 
+    maskBurntLeds();
     FastLED.show();
     frameCount++;
 
